@@ -12,6 +12,9 @@
   "scripts": {
     "build": "tsc",
     "start": "node dist/index.js",
+    "start:ingest": "node dist/ingest.js",
+    "dev": "tsx src/index.ts",
+    "dev:ingest": "tsx src/ingest.ts",
     "prepublishOnly": "npm run build"
   },
   "keywords": [
@@ -26,10 +29,13 @@
   "license": "BSD-2-Clause",
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.26.0",
+    "express": "^5.1.0",
     "zod": "^3.25.76"
   },
   "devDependencies": {
+    "@types/express": "^5.0.1",
     "@types/node": "^24.5.2",
+    "tsx": "^4.23.1",
     "typescript": "5.9.2"
   }
 }

@@ -1,0 +1,65 @@
+services:
+  # Receives snapshot pushes from the RuneLite plugin (bearer-token auth,
+  # no OAuth - this is a single trusted machine-to-machine leg).
+  osrs-ingest:
+    build:
+      context: .
+      dockerfile: Dockerfile.ingest
+    container_name: osrs-ingest
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      - PORT=8080
+      - SYNC_DIR=/data/osrs-sync
+    volumes:
+      - osrs-sync-data:/data/osrs-sync
+    ports:
+      - "${INGEST_HOST_PORT:-8094}:8080"
+    networks:
+      - osrs-net
+
+  # The MCP server itself - internal only, reachable through
+  # mcp-oauth-proxy below rather than published directly.
+  osrs-mcp:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: osrs-mcp
+    restart: unless-stopped
+    environment:
+      - MCP_TRANSPORT=http
+      - PORT=8080
+      - SYNC_DIR=/data/osrs-sync
+    volumes:
+      - osrs-sync-data:/data/osrs-sync:ro
+    networks:
+      - osrs-net
+
+  # OAuth 2.1 + PKCE sidecar for remote MCP clients (e.g. claude.ai).
+  # Terminates auth against your OIDC provider and only forwards
+  # already-authorized requests to osrs-mcp:8080/mcp.
+  mcp-oauth-proxy:
+    image: ghcr.io/allardy/mcp-oauth-proxy:latest
+    container_name: osrs-mcp-oauth-proxy
+    restart: unless-stopped
+    environment:
+      - OIDC_ISSUER_URL=${OIDC_ISSUER_URL}
+      - OIDC_AUDIENCE=${OAUTH_CLIENT_ID}
+      - RESOURCE_URL=${MCP_PUBLIC_URL}
+      - ALLOW_GROUPS=${ALLOW_GROUPS:-mcp-users}
+      - MCP_UPSTREAM_URL=http://osrs-mcp:8080
+      - MCP_UPSTREAM_PATH=/mcp
+      - STATIC_CLIENT_ID=${OAUTH_CLIENT_ID}
+      - STATIC_CLIENT_SECRET=${OAUTH_CLIENT_SECRET}
+    ports:
+      - "${MCP_HOST_PORT:-8096}:8080"
+    depends_on:
+      - osrs-mcp
+    networks:
+      - osrs-net
+
+networks:
+  osrs-net:
+
+volumes:
+  osrs-sync-data:

@@ -1,0 +1,23 @@
+FROM node:22-alpine AS build
+WORKDIR /app
+COPY package.json package-lock.json ./
+RUN npm ci
+COPY tsconfig.json ./
+COPY src ./src
+RUN npm run build
+
+FROM node:22-alpine AS runtime
+WORKDIR /app
+ENV NODE_ENV=production
+ENV PORT=8080
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev
+COPY --from=build /app/dist ./dist
+
+# Pre-create the snapshot dir owned by the unprivileged user so a fresh
+# named volume mounted here on first run inherits writable ownership.
+RUN mkdir -p /data/osrs-sync && chown node:node /data/osrs-sync
+
+USER node
+EXPOSE 8080
+CMD ["node", "dist/ingest.js"]
