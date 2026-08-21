@@ -463,9 +463,13 @@ export function buildServer(): McpServer {
         };
       }
 
-      let allItems = data.bank.tabs.flatMap((t) =>
-        t.items.map((item) => ({ ...item, tab: t.tabIndex }))
-      );
+      // Defense in depth: a real bank entry should never have quantity <=
+      // 0. The known cause (bank placeholders) is filtered at the plugin
+      // source now, but this guards against any other stray zero/missing-
+      // quantity row reaching here without one showing up as a phantom item.
+      let allItems = data.bank.tabs
+        .flatMap((t) => t.items.map((item) => ({ ...item, tab: t.tabIndex })))
+        .filter((item) => (item.quantity ?? 0) > 0);
 
       if (search) {
         const term = search.toLowerCase();
