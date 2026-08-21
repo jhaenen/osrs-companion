@@ -81,18 +81,22 @@ function getDb(): DatabaseSync | null {
     if (READONLY) {
       if (!existsSync(DB_PATH)) return null;
       db = new DatabaseSync(DB_PATH, { readOnly: true });
+      db.exec("PRAGMA busy_timeout = 5000");
     } else {
       mkdirSync(SYNC_DIR, { recursive: true });
       db = new DatabaseSync(DB_PATH);
+      // Set busy_timeout BEFORE the first statement that can actually take
+      // a lock (schema creation below). node:sqlite defaults busy_timeout
+      // to 0, so any other connection to this same file holding a lock (a
+      // one-off script like womBackfill.ts, or just two writes landing in
+      // the same instant) fails immediately with SQLITE_BUSY instead of
+      // waiting - observed in production, the backfill script briefly
+      // starved live plugin/WOM writes this way. Opening the connection and
+      // setting this pragma are both lock-free, so doing them first closes
+      // the gap completely rather than leaving SCHEMA_SQL itself racy.
+      db.exec("PRAGMA busy_timeout = 5000");
       db.exec(SCHEMA_SQL);
     }
-    // node:sqlite defaults busy_timeout to 0 - any other connection to this
-    // same file holding a lock (a one-off script like womBackfill.ts, or
-    // just two writes landing in the same instant) fails immediately with
-    // SQLITE_BUSY instead of waiting. Observed in production: the backfill
-    // script briefly starved live plugin/WOM writes this way. Give
-    // concurrent access a few seconds to clear instead of erroring on it.
-    db.exec("PRAGMA busy_timeout = 5000");
   } catch (err) {
     console.error("Failed to open history DB:", err instanceof Error ? err.message : err);
     return null;
