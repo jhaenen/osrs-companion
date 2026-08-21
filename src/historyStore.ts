@@ -47,7 +47,10 @@ const SCHEMA_SQL = `
 // If a cap or rollup is wanted later, add a DELETE on the two tables above
 // keyed off `timestamp` - the schema needs no migration for that.
 
-export type MetricSource = "plugin" | "wom";
+// "wom_backfill" is written only by the one-off historical backfill script
+// (src/scripts/womBackfill.ts), never by the live plugin push or poll
+// paths - kept distinct from "wom" so backfilled rows stay identifiable.
+export type MetricSource = "plugin" | "wom" | "wom_backfill";
 
 export interface MetricHistoryRow {
   timestamp: string;
@@ -188,6 +191,33 @@ export function getStateHistory(username: string, category: string, since: strin
   const handle = getDb();
   if (!handle) return [];
   return getSelectStatements(handle).state.all(username.toLowerCase(), category, since, until) as unknown as StateHistoryRow[];
+}
+
+// ── Below: used only by the one-off backfill script, not the live server ──
+
+/**
+ * Earliest timestamp already recorded for this metric, from ANY source
+ * (plugin, wom, or a prior wom_backfill). This is the live-tracking cutoff
+ * a backfill must stay strictly before - null means no existing coverage
+ * for this metric at all, so a backfill is free to cover its full range.
+ */
+export function getEarliestMetricTimestamp(username: string, metric: string): string | null {
+  const handle = getDb();
+  if (!handle) return null;
+  const row = handle
+    .prepare(`SELECT MIN(timestamp) AS earliest FROM metric_history WHERE username = ? AND metric = ?`)
+    .get(username.toLowerCase(), metric) as { earliest: string | null } | undefined;
+  return row?.earliest ?? null;
+}
+
+/** Row count for a given source, used to detect a prior backfill run before writing another one. */
+export function countRowsBySource(username: string, source: MetricSource): number {
+  const handle = getDb();
+  if (!handle) return 0;
+  const row = handle
+    .prepare(`SELECT COUNT(*) AS count FROM metric_history WHERE username = ? AND source = ?`)
+    .get(username.toLowerCase(), source) as { count: number } | undefined;
+  return row?.count ?? 0;
 }
 
 export { DB_PATH };

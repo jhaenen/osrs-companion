@@ -40,6 +40,16 @@ interface WomPlayerResponse {
   };
 }
 
+// A single historical entry from GET /players/:username/snapshots - same
+// per-metric `data` shape as latestSnapshot above, but standalone with its
+// own timestamp rather than nested under a player response.
+export interface WomSnapshotListItem {
+  playerId: number;
+  createdAt: string;
+  importedAt: string | null;
+  data: WomSnapshotData;
+}
+
 async function womFetch<T>(path: string, init?: RequestInit): Promise<T | null> {
   const headers: Record<string, string> = { "User-Agent": USER_AGENT };
   if (WOM_API_KEY) headers["x-api-key"] = WOM_API_KEY;
@@ -71,20 +81,41 @@ export async function fetchPlayerSnapshot(username: string): Promise<WomPlayerRe
   return womFetch<WomPlayerResponse>(`/players/${encodeURIComponent(username)}`);
 }
 
+// WOM's documented max for this endpoint's `limit` param (server-enforced;
+// larger values are rejected, not silently clamped).
+export const WOM_SNAPSHOTS_PAGE_SIZE_MAX = 200;
+
+/**
+ * One page of a player's full historical snapshot record, newest-first.
+ * Omitting period/startDate/endDate (as this does) is deliberate: WOM's
+ * snapshot query only applies a date filter when one of those is present,
+ * so leaving all three out returns the player's entire unranked-inclusive
+ * history with no implicit recency window - exactly what a full backfill
+ * needs. Callers paginate via limit/offset until a short page comes back.
+ */
+export async function fetchPlayerSnapshots(
+  username: string,
+  { limit, offset }: { limit: number; offset: number }
+): Promise<WomSnapshotListItem[] | null> {
+  const params = new URLSearchParams({ limit: String(limit), offset: String(offset) });
+  return womFetch<WomSnapshotListItem[]>(`/players/${encodeURIComponent(username)}/snapshots?${params}`);
+}
+
 export interface WomMergeableMetrics {
   skills: Record<string, { level: number; xp: number }>;
   bossKills: Record<string, number>;
 }
 
 /**
- * Flattens a WOM player response down to just the metrics we're allowed to
- * merge (see project scope notes: skill xp/levels and boss/activity kill
- * counts only - never bank/inventory/equipment/quests/diaries/CAs, none of
- * which are on the hiscores). WOM reports -1 for unranked metrics; those
- * are dropped rather than merged in as a real 0.
+ * Flattens a raw WOM snapshot `data` object down to just the metrics we're
+ * allowed to merge (see project scope notes: skill xp/levels and
+ * boss/activity kill counts only - never bank/inventory/equipment/quests/
+ * diaries/CAs, none of which are on the hiscores). WOM reports -1 for
+ * unranked metrics; those are dropped rather than merged in as a real 0.
+ * "overall" is deliberately excluded - it's a derived sum, and the plugin
+ * already computes and owns its own OVERALL entry.
  */
-export function extractMergeableMetrics(resp: WomPlayerResponse): WomMergeableMetrics {
-  const data = resp.latestSnapshot?.data;
+export function extractMergeableMetricsFromData(data: WomSnapshotData | undefined): WomMergeableMetrics {
   const skills: Record<string, { level: number; xp: number }> = {};
   const bossKills: Record<string, number> = {};
   if (!data) return { skills, bossKills };
@@ -101,4 +132,9 @@ export function extractMergeableMetrics(resp: WomPlayerResponse): WomMergeableMe
     if (entry.score >= 0) bossKills[key] = entry.score;
   }
   return { skills, bossKills };
+}
+
+/** Same as extractMergeableMetricsFromData, for a full player response. */
+export function extractMergeableMetrics(resp: WomPlayerResponse): WomMergeableMetrics {
+  return extractMergeableMetricsFromData(resp.latestSnapshot?.data);
 }

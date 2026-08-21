@@ -15,6 +15,7 @@
     "start:ingest": "node dist/ingest.js",
     "dev": "tsx src/index.ts",
     "dev:ingest": "tsx src/ingest.ts",
+    "backfill:wom": "node dist/scripts/womBackfill.js",
     "prepublishOnly": "npm run build"
   },
   "keywords": [
