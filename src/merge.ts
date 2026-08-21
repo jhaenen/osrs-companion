@@ -67,7 +67,19 @@ function mergeBossKills(
 ): Record<string, number> {
   const merged = { ...(existing ?? {}) };
   for (const [boss, kc] of Object.entries(incoming)) {
-    const prev = merged[boss] ?? 0;
+    const prev = merged[boss];
+    if (prev === undefined) {
+      // First time this metric has ever appeared in the snapshot (true for
+      // every boss/activity on a player's very first WOM poll, since the
+      // plugin never populates bossKills at all). Treating "never recorded"
+      // as a baseline of 0 would write a fake "0 -> kc" history row for
+      // whatever the player's kill count already was BEFORE we ever started
+      // watching - indistinguishable from a real increase, and duplicated
+      // by a later backfill run correctly dating that same real history.
+      // Mirrors mergeSkills' behavior above: seed silently, no row.
+      merged[boss] = kc;
+      continue;
+    }
     if (kc > prev) {
       recordMetricChange(username, `kc:${boss}`, prev, kc, source, timestamp);
       merged[boss] = kc;
