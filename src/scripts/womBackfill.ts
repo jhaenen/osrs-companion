@@ -24,7 +24,7 @@ import {
   WOM_SNAPSHOTS_PAGE_SIZE_MAX,
   type WomSnapshotListItem,
 } from "../womClient.js";
-import { getEarliestMetricTimestamp, countRowsBySource, recordMetricChange } from "../historyStore.js";
+import { getEarliestMetricTimestamp, countRowsBySource, recordMetricChange, runInTransaction } from "../historyStore.js";
 
 const SOURCE = "wom_backfill" as const;
 
@@ -139,57 +139,71 @@ async function main(): Promise<void> {
     }
   }
 
-  const summaries: MetricSummary[] = [];
+  // All writes for the whole run happen inside one transaction (only when
+  // --commit is set - a dry run does no writes at all). A large batch of
+  // individually auto-committed INSERTs would each fsync and briefly hold
+  // the write lock on its own; observed in production that this was long
+  // enough to repeatedly starve the live plugin/WOM writers out of the
+  // same file. One transaction means one lock hold, one fsync, and (with
+  // busy_timeout now set - see historyStore.ts) any live writer that does
+  // land mid-transaction waits a few seconds instead of failing outright.
+  const buildSummaries = (): MetricSummary[] => {
+    const results: MetricSummary[] = [];
 
-  for (const [metric, points] of [...seriesByMetric.entries()].sort(([a], [b]) => a.localeCompare(b))) {
-    // Cutoff = earliest timestamp already recorded for this metric from ANY
-    // source (plugin push or live wom poll). Only snapshot pairs whose
-    // later point falls strictly before this get backfilled - once WOM's
-    // own history reaches the point live tracking already covers, stop for
-    // this metric and don't touch that range at all.
-    const cutoff = getEarliestMetricTimestamp(normalizedUsername, metric);
+    for (const [metric, points] of [...seriesByMetric.entries()].sort(([a], [b]) => a.localeCompare(b))) {
+      // Cutoff = earliest timestamp already recorded for this metric from
+      // ANY source (plugin push or live wom poll). Only snapshot pairs
+      // whose later point falls strictly before this get backfilled - once
+      // WOM's own history reaches the point live tracking already covers,
+      // stop for this metric and don't touch that range at all.
+      const cutoff = getEarliestMetricTimestamp(normalizedUsername, metric);
 
-    const summary: MetricSummary = {
-      metric,
-      pulled: points.length,
-      written: 0,
-      skippedNoChange: 0,
-      skippedDecrease: 0,
-      skippedAtOrAfterCutoff: 0,
-      cutoff,
-      earliestWritten: null,
-      latestWritten: null,
-    };
+      const summary: MetricSummary = {
+        metric,
+        pulled: points.length,
+        written: 0,
+        skippedNoChange: 0,
+        skippedDecrease: 0,
+        skippedAtOrAfterCutoff: 0,
+        cutoff,
+        earliestWritten: null,
+        latestWritten: null,
+      };
 
-    for (let i = 1; i < points.length; i++) {
-      const prev = points[i - 1];
-      const curr = points[i];
+      for (let i = 1; i < points.length; i++) {
+        const prev = points[i - 1];
+        const curr = points[i];
 
-      if (cutoff !== null && curr.timestamp >= cutoff) {
-        summary.skippedAtOrAfterCutoff++;
-        continue;
+        if (cutoff !== null && curr.timestamp >= cutoff) {
+          summary.skippedAtOrAfterCutoff++;
+          continue;
+        }
+        if (curr.value === prev.value) {
+          summary.skippedNoChange++;
+          continue;
+        }
+        if (curr.value < prev.value) {
+          // Not expected in normal play (xp/kc are monotonic), but hiscores
+          // data can be noisy - skip rather than write a value going backwards.
+          summary.skippedDecrease++;
+          continue;
+        }
+
+        if (commit) {
+          recordMetricChange(normalizedUsername, metric, prev.value, curr.value, SOURCE, curr.timestamp);
+        }
+        summary.written++;
+        summary.earliestWritten ??= curr.timestamp;
+        summary.latestWritten = curr.timestamp;
       }
-      if (curr.value === prev.value) {
-        summary.skippedNoChange++;
-        continue;
-      }
-      if (curr.value < prev.value) {
-        // Not expected in normal play (xp/kc are monotonic), but hiscores
-        // data can be noisy - skip rather than write a value going backwards.
-        summary.skippedDecrease++;
-        continue;
-      }
 
-      if (commit) {
-        recordMetricChange(normalizedUsername, metric, prev.value, curr.value, SOURCE, curr.timestamp);
-      }
-      summary.written++;
-      summary.earliestWritten ??= curr.timestamp;
-      summary.latestWritten = curr.timestamp;
+      results.push(summary);
     }
 
-    summaries.push(summary);
-  }
+    return results;
+  };
+
+  const summaries = commit ? runInTransaction(buildSummaries) : buildSummaries();
 
   console.log("\n=== Backfill summary ===");
   for (const s of summaries) {

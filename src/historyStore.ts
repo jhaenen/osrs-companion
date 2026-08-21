@@ -86,6 +86,13 @@ function getDb(): DatabaseSync | null {
       db = new DatabaseSync(DB_PATH);
       db.exec(SCHEMA_SQL);
     }
+    // node:sqlite defaults busy_timeout to 0 - any other connection to this
+    // same file holding a lock (a one-off script like womBackfill.ts, or
+    // just two writes landing in the same instant) fails immediately with
+    // SQLITE_BUSY instead of waiting. Observed in production: the backfill
+    // script briefly starved live plugin/WOM writes this way. Give
+    // concurrent access a few seconds to clear instead of erroring on it.
+    db.exec("PRAGMA busy_timeout = 5000");
   } catch (err) {
     console.error("Failed to open history DB:", err instanceof Error ? err.message : err);
     return null;
@@ -208,6 +215,31 @@ export function getEarliestMetricTimestamp(username: string, metric: string): st
     .prepare(`SELECT MIN(timestamp) AS earliest FROM metric_history WHERE username = ? AND metric = ?`)
     .get(username.toLowerCase(), metric) as { earliest: string | null } | undefined;
   return row?.earliest ?? null;
+}
+
+/**
+ * Runs fn() inside a single SQLite transaction, committing on success and
+ * rolling back on throw. Used by the backfill script so a large batch of
+ * inserts holds the write lock (and fsyncs) once instead of once per row -
+ * both faster and shorter-lived contention against the live server's own
+ * writes than one implicit auto-commit transaction per INSERT.
+ */
+export function runInTransaction<T>(fn: () => T): T {
+  const handle = getDb();
+  if (!handle) return fn();
+  handle.exec("BEGIN");
+  try {
+    const result = fn();
+    handle.exec("COMMIT");
+    return result;
+  } catch (err) {
+    try {
+      handle.exec("ROLLBACK");
+    } catch {
+      // ignore - the original error is what matters
+    }
+    throw err;
+  }
 }
 
 /** Row count for a given source, used to detect a prior backfill run before writing another one. */
