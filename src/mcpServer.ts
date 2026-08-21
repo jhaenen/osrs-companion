@@ -494,15 +494,17 @@ export function buildServer(): McpServer {
         `# ${username}'s Bank — ${allItems.length + potionItems.length} items found`,
         freshnessLine(data.lastUpdated),
       ];
+      // Always show the quantity, even at exactly 1: this list is filtered
+      // to quantity > 0 upstream, so an item with no quantity shown at all
+      // reads as indistinguishable from a phantom/placeholder entry - which
+      // is exactly the false alarm a hidden "x1" caused once already.
       for (const item of allItems) {
-        const qty = item.quantity > 1 ? ` x${item.quantity.toLocaleString()}` : "";
-        lines.push(`  [Tab ${item.tab}] ${item.name}${qty} (ID: ${item.itemId})`);
+        lines.push(`  [Tab ${item.tab}] ${item.name} x${item.quantity.toLocaleString()} (ID: ${item.itemId})`);
       }
       if (potionItems.length > 0) {
         lines.push("", "## Potion Storage");
         for (const item of potionItems) {
-          const qty = item.quantity > 1 ? ` x${item.quantity.toLocaleString()}` : "";
-          lines.push(`  ${item.name}${qty} (${item.doses.toLocaleString()} doses, ID: ${item.itemId})`);
+          lines.push(`  ${item.name} x${item.quantity.toLocaleString()} (${item.doses.toLocaleString()} doses, ID: ${item.itemId})`);
         }
       }
 
