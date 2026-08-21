@@ -762,6 +762,15 @@ export function buildServer(): McpServer {
           lines.push(`  ${t[0].toUpperCase()}${t.slice(1)} (${doneCount}/${tasks.length} done)${diary[t] ? " - TIER COMPLETE" : ""}:`);
           for (const task of tasks) {
             lines.push(`    [${task.done ? "x" : " "}] ${task.name}`);
+            // Requirements only for outstanding tasks - a done task's
+            // requirements aren't useful for planning what's left to do,
+            // and this tool exists specifically so callers don't have to
+            // go look them up elsewhere for the tasks that still matter.
+            if (!task.done) {
+              for (const req of task.requirements) {
+                lines.push(`        - ${req}`);
+              }
+            }
           }
         }
       }

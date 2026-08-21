@@ -23,6 +23,7 @@ type VarSpec =
 
 interface TaskSpec extends Record<string, unknown> {
   name: string;
+  requirements: string[];
   type: "player" | "bits";
   var_id: number;
   offset?: number;
@@ -93,6 +94,7 @@ function resolveTask(
 export interface DiaryTaskStatus {
   index: number;
   name: string;
+  requirements: string[];
   done: boolean;
 }
 
@@ -118,6 +120,7 @@ export function getDiaryTaskStatus(
   return tierSpec.tasks.map((task, index) => ({
     index,
     name: task.name,
+    requirements: task.requirements,
     done: resolveTask(task, vp, vb, lutRegion, lutTier, index),
   }));
 }
