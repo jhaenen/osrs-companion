@@ -2,7 +2,8 @@
 import express from "express";
 import { timingSafeEqual } from "node:crypto";
 import { playerSyncDataSchema } from "./schema.js";
-import { writeSnapshot } from "./snapshotStore.js";
+import { mergeAndStore } from "./merge.js";
+import { startWomPoller } from "./womPoller.js";
 
 const TOKEN = process.env.INGEST_TOKEN;
 if (!TOKEN) {
@@ -41,7 +42,7 @@ app.post("/snapshot", (req, res) => {
     return;
   }
 
-  writeSnapshot(parsed.data)
+  mergeAndStore({ source: "plugin", username: parsed.data.player.username, timestamp: parsed.data.lastUpdated, ...parsed.data })
     .then(() => res.status(204).end())
     .catch((err) => {
       console.error("Failed to write snapshot:", err);
@@ -57,3 +58,5 @@ const port = Number(process.env.PORT ?? 8080);
 app.listen(port, () => {
   console.log(`OSRS ingest endpoint listening on http://0.0.0.0:${port}/snapshot`);
 });
+
+startWomPoller();

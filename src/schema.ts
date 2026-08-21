@@ -62,6 +62,13 @@ export const playerSyncDataSchema = z.object({
     world: z.number(),
   }),
   skills: z.record(skillEntrySchema).optional(),
+  // Boss/activity kill counts. Unlike every other field here, this one does
+  // NOT mirror the plugin's Java model - the plugin doesn't track kill
+  // counts at all. It's populated solely by the Wise Old Man merge job
+  // (see merge.ts), keyed by WOM's lowercase metric name (e.g. "zulrah",
+  // "clue_scrolls_easy"). Present here so it lives in the same merged
+  // snapshot as everything else, per the single-source-of-truth design.
+  bossKills: z.record(z.number()).optional(),
   bank: bankDataSchema.optional(),
   inventory: z.array(inventoryItemSchema).optional(),
   equipment: z.record(itemEntrySchema).optional(),
@@ -71,3 +78,9 @@ export const playerSyncDataSchema = z.object({
 });
 
 export type PlayerSyncData = z.infer<typeof playerSyncDataSchema>;
+export type ItemEntry = z.infer<typeof itemEntrySchema>;
+export type InventoryItem = z.infer<typeof inventoryItemSchema>;
+export type BankData = z.infer<typeof bankDataSchema>;
+export type QuestEntry = z.infer<typeof questEntrySchema>;
+export type DiaryRegion = z.infer<typeof diaryRegionSchema>;
+export type CombatAchievementData = z.infer<typeof combatAchievementDataSchema>;

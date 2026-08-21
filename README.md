@@ -17,27 +17,63 @@ MCP server/AI assistant don't run on the same machine. See
 - **Page Summaries** — Get introductory summaries of wiki pages
 - **GE Prices** — Look up current Grand Exchange buy/sell prices
 - **WikiSync Player Data** — Fetch player data via the WikiSync plugin
-- **Synced Player Data** — Read detailed player data pushed by the companion
-  RuneLite plugin (bank, skills, quests, equipment, inventory, diaries,
-  combat achievements), with a freshness indicator on every response
+- **Synced Player Data** — Read detailed player data merged from the
+  companion RuneLite plugin (bank, skills, quests, equipment, inventory,
+  diaries, combat achievements) and Wise Old Man (skill xp, boss/activity
+  kill counts), with a freshness indicator on every response
+- **Progress History** — Query when skill xp, kill counts, quests, diaries,
+  and combat achievements last changed, and project time-to-level from a
+  recent xp rate
 
 ## Architecture
 
-Three pieces, two of which live in this repo:
+Four logical pieces, three of which live in this repo:
 
 ```
-RuneLite plugin  --HTTPS + bearer token-->  osrs-ingest  --shared volume-->  osrs-mcp  --HTTPS + OAuth-->  MCP client
-                                             (this repo)                     (this repo)
+RuneLite plugin  --HTTPS + bearer token--\
+                                           >-->  osrs-ingest  --shared volume-->  osrs-mcp  --HTTPS + OAuth-->  MCP client
+Wise Old Man API  <--HTTPS (poll)--------/       (this repo)                     (this repo)
 ```
 
 - **`osrs-ingest`** (`src/ingest.ts`) — a small Express service that accepts
-  authenticated snapshot pushes from the plugin and stores the latest one
-  per player. This leg is machine-to-machine (one trusted plugin instance
-  pushing its own data), so it's gated with a single long-lived bearer
-  token rather than a full OAuth flow.
-- **`osrs-mcp`** (`src/index.ts`) — the MCP server. Reads whatever
-  `osrs-ingest` last wrote. Wiki search, summaries, prices, and the
-  WikiSync `player` tool are unchanged outbound fetches to public APIs.
+  authenticated snapshot pushes from the plugin. This leg is
+  machine-to-machine (one trusted plugin instance pushing its own data), so
+  it's gated with a single long-lived bearer token rather than a full OAuth
+  flow. It also runs the **Wise Old Man poll job** (`src/womPoller.ts`) on a
+  timer, since it's the side of this deployment with write access to the
+  shared snapshot volume.
+- **`osrs-mcp`** (`src/index.ts`) — the MCP server. Reads whatever the merge
+  logic below last wrote. Wiki search, summaries, prices, and the WikiSync
+  `player` tool are unchanged outbound fetches to public APIs.
+
+### Merging plugin + Wise Old Man data
+
+The RuneLite plugin only reports data while the client is open on a desktop
+machine, so it structurally can't see mobile-only play. Wise Old Man reads
+the public hiscores, which do reflect mobile play, so it's polled
+periodically (`WOM_POLL_INTERVAL_MS`, default 15 minutes) as a second input
+into the same snapshot the plugin pushes to - not a separate data source the
+AI needs to know about.
+
+Every skill xp value and every boss/activity kill count is merged with
+**`merged_value = max(plugin_value, wom_value)`**, never "whichever arrived
+most recently" - both are monotonically non-decreasing in normal play, but
+WOM's own snapshot timestamp reflects when it happened to check the
+hiscores (which only refresh roughly hourly), not when the xp was actually
+earned, so a "newer" WOM read can still carry a stale, lower value than what
+the plugin already pushed minutes earlier. `get_my_stats` and every history
+tool below return one number per metric with no indication of which source
+it came from - `source` is recorded in the history tables purely for
+debugging, never surfaced by the tools.
+
+Wise Old Man can only ever contribute skill xp/levels and boss/activity kill
+counts - bank, inventory, equipment, quests, achievement diaries, and combat
+achievements aren't on the public hiscores at all, so the plugin remains the
+sole source for all of that regardless of merging.
+
+This is what replaces a separate Wise Old Man MCP connector: rather than an
+AI client juggling two servers and deciding which one to ask, there's one
+merged source of truth here.
 
 ## Running locally (stdio, for Claude Code / Claude Desktop on the same machine)
 
@@ -92,6 +128,27 @@ Every player-sync tool's response includes a `Last Updated` line with how
 long ago the snapshot landed (e.g. "2m ago") — treat the data as "recent",
 not "live": there's an inherent gap between an in-game change and the
 snapshot reaching the server.
+
+### History Tools
+
+Read from local storage only (a small SQLite database alongside the
+snapshots) - never a live call to Wise Old Man. A row only exists there
+because a genuine change was detected on a plugin push or WOM poll, so an
+empty range returns a clean "no changes" message rather than an error.
+
+| Tool | Description |
+|------|-------------|
+| `skill_xp_gained` | Xp (skill) or kill count (boss/activity) gained over a period |
+| `skill_xp_timeline` | Time series of changes for a skill or boss/activity metric |
+| `cooking_progress_since` | Projects time to a target Cooking level from a recent xp rate |
+| `quest_history` | Quest state changes over a period |
+| `diary_history` | Achievement diary tier completions over a period |
+| `combat_achievement_history` | Combat achievement task/tier completions over a period |
+
+`skill_xp_gained` and `skill_xp_timeline` accept either a skill name (e.g.
+`COOKING`) or a Wise Old Man boss/activity metric name (e.g. `zulrah`,
+`clue_scrolls_easy`) - both live in the same merged history, so the same
+tools cover both.
 
 ## Deploying remotely (Docker + OAuth)
 
@@ -177,12 +234,18 @@ want to avoid a brief gap in syncing.
 
 The MCP server runs via stdio (local) or Streamable HTTP (remote) transport,
 selected by `MCP_TRANSPORT`. Wiki and price tools fetch from public OSRS
-APIs. Player sync tools read the latest snapshot written by `osrs-ingest`
-from `SYNC_DIR` (default `~/.runelite/osrs-companion/` locally, or a shared
-volume in the Docker deployment).
+APIs. Player sync tools read the latest merged snapshot from `SYNC_DIR`
+(default `~/.runelite/osrs-companion/` locally, or a shared volume in the
+Docker deployment) - written by `osrs-ingest` on every plugin push, and by
+the Wise Old Man poll job on its own timer (see "Merging plugin + Wise Old
+Man data" above). History tools read a small SQLite database
+(`history.db`) in the same directory, populated only when a merge actually
+changes something.
 
-No data is stored in the cloud beyond wherever you deploy this yourself. No
-API keys required for the wiki/price tools.
+No data is stored in the cloud beyond wherever you deploy this yourself
+and whatever Wise Old Man already has via the public hiscores. No API key
+is required for `WOM_API_KEY` — it only raises WOM's rate limit, which a
+single-player poll every 15+ minutes doesn't come close to needing.
 
 ## Attribution
 
@@ -193,9 +256,9 @@ All wiki tool responses include an attribution notice automatically.
 
 Grand Exchange price data is provided by the
 [OSRS Wiki Prices API](https://prices.runescape.wiki). Player data is
-fetched via the [WikiSync API](https://sync.runescape.wiki) or read from
-snapshots pushed by the companion RuneLite plugin — neither contains wiki
-article content.
+fetched via the [WikiSync API](https://sync.runescape.wiki), [Wise Old
+Man](https://wiseoldman.net), or read from snapshots pushed by the
+companion RuneLite plugin — none of which contain wiki article content.
 
 ## License
 

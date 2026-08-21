@@ -1,6 +1,38 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { listSyncedPlayers, readSnapshot, SYNC_DIR } from "./snapshotStore.js";
+import { getMetricGain, getMetricHistory, getStateHistory } from "./historyStore.js";
+import { xpForLevel, formatDuration } from "./osrsXp.js";
+import type { PlayerSyncData } from "./schema.js";
+
+const EPOCH = new Date(0).toISOString();
+
+// Resolves a user-supplied metric name to the internal history key. Skills
+// are matched case-insensitively against synced skill names; anything else
+// falls back to a boss/activity kill-count lookup (WOM's metric names are
+// lowercase, e.g. "zulrah", "clue_scrolls_easy"). Deliberately source-
+// agnostic - the caller can't tell and doesn't need to know whether a given
+// metric's current value most recently moved via the plugin or WOM.
+function resolveMetric(
+  data: PlayerSyncData,
+  metric: string
+): { key: string; label: string; kind: "skill" | "kc"; current: number } | null {
+  const upper = metric.toUpperCase();
+  if (data.skills?.[upper]) {
+    return { key: `skill:${upper}`, label: upper, kind: "skill", current: data.skills[upper].xp };
+  }
+  const lower = metric.toLowerCase();
+  if (data.bossKills?.[lower] !== undefined) {
+    return { key: `kc:${lower}`, label: lower, kind: "kc", current: data.bossKills[lower] };
+  }
+  return null;
+}
+
+function metricNotFoundMessage(username: string, metric: string, data: PlayerSyncData): string {
+  const skills = Object.keys(data.skills ?? {}).join(", ") || "none synced";
+  const bossKills = Object.keys(data.bossKills ?? {}).join(", ") || "none synced";
+  return `Metric "${metric}" not found for "${username}".\nAvailable skills: ${skills}\nAvailable boss/activity metrics: ${bossKills}`;
+}
 
 // ── Types ──────────────────────────────────────────────────────────────
 
@@ -687,6 +719,188 @@ export function buildServer(): McpServer {
         );
       }
 
+      return { content: [{ type: "text", text: lines.join("\n") }] };
+    }
+  );
+
+  // ── History Tools (read from local storage only, no live WOM calls) ──
+
+  server.tool(
+    "skill_xp_gained",
+    "Get xp (for a skill) or kill count (for a boss/activity) gained over a time period, computed from stored history. Works for any synced skill (e.g. 'MINING') or boss/activity metric (e.g. 'zulrah', 'clue_scrolls_easy') - the merged snapshot doesn't distinguish where the data came from.",
+    {
+      username: z.string().describe("Player username"),
+      metric: z.string().describe("Skill name (e.g. 'COOKING') or boss/activity name (e.g. 'zulrah')"),
+      since: z.string().optional().describe("ISO 8601 timestamp to measure gain from. Defaults to 7 days ago."),
+      until: z.string().optional().describe("ISO 8601 timestamp to measure gain until. Defaults to now."),
+    },
+    async ({ username, metric, since, until }) => {
+      const data = await readSnapshot(username);
+      if (!data) return { content: [{ type: "text", text: `No synced data found for "${username}".` }] };
+
+      const resolved = resolveMetric(data, metric);
+      if (!resolved) return { content: [{ type: "text", text: metricNotFoundMessage(username, metric, data) }] };
+
+      const sinceIso = since ?? new Date(Date.now() - 7 * 24 * 3600 * 1000).toISOString();
+      const untilIso = until ?? new Date().toISOString();
+      const gain = getMetricGain(username, resolved.key, sinceIso, untilIso);
+      const unit = resolved.kind === "skill" ? "xp" : "kills";
+
+      if (gain === 0) {
+        return { content: [{ type: "text", text: `No change in ${resolved.label} between ${sinceIso} and ${untilIso}.` }] };
+      }
+      return {
+        content: [
+          {
+            type: "text",
+            text: `# ${username} — ${resolved.label} gained\n${sinceIso} → ${untilIso}\n+${gain.toLocaleString()} ${unit}\nCurrent: ${resolved.current.toLocaleString()}`,
+          },
+        ],
+      };
+    }
+  );
+
+  server.tool(
+    "skill_xp_timeline",
+    "Get the time series of changes for a skill or boss/activity metric over a date range, computed from stored history (not a live WOM call).",
+    {
+      username: z.string().describe("Player username"),
+      metric: z.string().describe("Skill name (e.g. 'COOKING') or boss/activity name (e.g. 'zulrah')"),
+      since: z.string().optional().describe("ISO 8601 start of the range. Defaults to 30 days ago."),
+      until: z.string().optional().describe("ISO 8601 end of the range. Defaults to now."),
+    },
+    async ({ username, metric, since, until }) => {
+      const data = await readSnapshot(username);
+      if (!data) return { content: [{ type: "text", text: `No synced data found for "${username}".` }] };
+
+      const resolved = resolveMetric(data, metric);
+      if (!resolved) return { content: [{ type: "text", text: metricNotFoundMessage(username, metric, data) }] };
+
+      const sinceIso = since ?? new Date(Date.now() - 30 * 24 * 3600 * 1000).toISOString();
+      const untilIso = until ?? new Date().toISOString();
+      const rows = getMetricHistory(username, resolved.key, sinceIso, untilIso);
+
+      if (rows.length === 0) {
+        return { content: [{ type: "text", text: `No changes in ${resolved.label} between ${sinceIso} and ${untilIso}.` }] };
+      }
+
+      const lines = [`# ${username} — ${resolved.label} timeline`, `${sinceIso} → ${untilIso}`, ""];
+      for (const row of rows) {
+        lines.push(`  ${row.timestamp}: ${row.oldValue.toLocaleString()} → ${row.newValue.toLocaleString()} (+${(row.newValue - row.oldValue).toLocaleString()})`);
+      }
+      return { content: [{ type: "text", text: lines.join("\n") }] };
+    }
+  );
+
+  server.tool(
+    "cooking_progress_since",
+    "Estimate time remaining until a target Cooking level (default 99), by projecting the xp/hour rate observed since a given time. Combines xp-gained history with a simple burn-rate calculation.",
+    {
+      username: z.string().describe("Player username"),
+      since: z.string().optional().describe("ISO 8601 timestamp to measure the xp rate from. Defaults to 7 days ago."),
+      targetLevel: z.number().min(2).max(99).default(99).describe("Target Cooking level"),
+    },
+    async ({ username, since, targetLevel }) => {
+      const data = await readSnapshot(username);
+      if (!data) return { content: [{ type: "text", text: `No synced data found for "${username}".` }] };
+
+      const cooking = data.skills?.COOKING;
+      if (!cooking) return { content: [{ type: "text", text: `No Cooking data synced for "${username}".` }] };
+
+      const sinceIso = since ?? new Date(Date.now() - 7 * 24 * 3600 * 1000).toISOString();
+      const untilIso = new Date().toISOString();
+      const gained = getMetricGain(username, "skill:COOKING", sinceIso, untilIso);
+      const elapsedHours = (Date.parse(untilIso) - Date.parse(sinceIso)) / 3_600_000;
+
+      if (gained <= 0 || elapsedHours <= 0) {
+        return { content: [{ type: "text", text: `No Cooking xp gained since ${sinceIso} — can't estimate a rate.` }] };
+      }
+
+      const targetXp = xpForLevel(targetLevel);
+      const xpRemaining = targetXp - cooking.xp;
+      if (xpRemaining <= 0) {
+        return {
+          content: [
+            { type: "text", text: `${username} has already reached level ${targetLevel} Cooking (current: level ${cooking.level}, ${cooking.xp.toLocaleString()} xp).` },
+          ],
+        };
+      }
+
+      const xpPerHour = gained / elapsedHours;
+      const hoursRemaining = xpRemaining / xpPerHour;
+
+      const lines = [
+        `# ${username} — Cooking progress toward level ${targetLevel}`,
+        `Current: level ${cooking.level} (${cooking.xp.toLocaleString()} xp)`,
+        `Rate since ${sinceIso}: +${Math.round(xpPerHour).toLocaleString()} xp/hour (${gained.toLocaleString()} xp over ${elapsedHours.toFixed(1)}h)`,
+        `Xp remaining to level ${targetLevel}: ${xpRemaining.toLocaleString()}`,
+        `Estimated time at this rate: ${formatDuration(hoursRemaining)}`,
+        "",
+        "Projects the recent rate forward assuming similar play patterns continue.",
+      ];
+      return { content: [{ type: "text", text: lines.join("\n") }] };
+    }
+  );
+
+  server.tool(
+    "quest_history",
+    "Get quest state changes (e.g. started, completed) for a player over a date range. Defaults to all recorded history.",
+    {
+      username: z.string().describe("Player username"),
+      since: z.string().optional().describe("ISO 8601 start of the range. Defaults to all recorded history."),
+      until: z.string().optional().describe("ISO 8601 end of the range. Defaults to now."),
+    },
+    async ({ username, since, until }) => {
+      const rows = getStateHistory(username, "quest", since ?? EPOCH, until ?? new Date().toISOString());
+      if (rows.length === 0) {
+        return { content: [{ type: "text", text: `No quest changes recorded for "${username}" in this range.` }] };
+      }
+      const lines = [`# ${username} — Quest history`, ""];
+      for (const row of rows) {
+        lines.push(`  ${row.timestamp}: ${row.itemName} — ${row.oldState} → ${row.newState}`);
+      }
+      return { content: [{ type: "text", text: lines.join("\n") }] };
+    }
+  );
+
+  server.tool(
+    "diary_history",
+    "Get achievement diary tier completions for a player over a date range. Defaults to all recorded history.",
+    {
+      username: z.string().describe("Player username"),
+      since: z.string().optional().describe("ISO 8601 start of the range. Defaults to all recorded history."),
+      until: z.string().optional().describe("ISO 8601 end of the range. Defaults to now."),
+    },
+    async ({ username, since, until }) => {
+      const rows = getStateHistory(username, "diary", since ?? EPOCH, until ?? new Date().toISOString());
+      if (rows.length === 0) {
+        return { content: [{ type: "text", text: `No diary changes recorded for "${username}" in this range.` }] };
+      }
+      const lines = [`# ${username} — Achievement diary history`, ""];
+      for (const row of rows) {
+        lines.push(`  ${row.timestamp}: ${row.itemName} — ${row.oldState} → ${row.newState}`);
+      }
+      return { content: [{ type: "text", text: lines.join("\n") }] };
+    }
+  );
+
+  server.tool(
+    "combat_achievement_history",
+    "Get combat achievement task/tier completions for a player over a date range. Defaults to all recorded history.",
+    {
+      username: z.string().describe("Player username"),
+      since: z.string().optional().describe("ISO 8601 start of the range. Defaults to all recorded history."),
+      until: z.string().optional().describe("ISO 8601 end of the range. Defaults to now."),
+    },
+    async ({ username, since, until }) => {
+      const rows = getStateHistory(username, "combat_achievement", since ?? EPOCH, until ?? new Date().toISOString());
+      if (rows.length === 0) {
+        return { content: [{ type: "text", text: `No combat achievement changes recorded for "${username}" in this range.` }] };
+      }
+      const lines = [`# ${username} — Combat achievement history`, ""];
+      for (const row of rows) {
+        lines.push(`  ${row.timestamp}: ${row.itemName} — ${row.oldState} → ${row.newState}`);
+      }
       return { content: [{ type: "text", text: lines.join("\n") }] };
     }
   );

@@ -30,6 +30,11 @@ services:
       - MCP_TRANSPORT=http
       - PORT=8080
       - SYNC_DIR=/data/osrs-sync
+      # This container's volume mount below is read-only - tells the
+      # history store to open its SQLite DB read-only too, rather than
+      # trying (and failing) to create/migrate it here. The WOM poller
+      # running in osrs-ingest owns writing to it.
+      - HISTORY_DB_READONLY=true
     volumes:
       - osrs-sync-data:/data/osrs-sync:ro
     networks:
