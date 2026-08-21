@@ -37,6 +37,11 @@ export interface MergeInput {
   equipment?: Record<string, ItemEntry>;
   quests?: QuestEntry[];
   achievementDiaries?: Record<string, DiaryRegion>;
+  // Raw per-task diary bits - plain overwrite, no diffing/history (the
+  // decoded booleans are derived at read time in diaryTasks.ts, not
+  // stored decoded, so there's nothing meaningful to diff here yet).
+  diaryTaskVarps?: Record<string, number>;
+  diaryTaskVarbits?: Record<string, number>;
   combatAchievements?: CombatAchievementData;
 }
 
@@ -195,6 +200,8 @@ export async function mergeAndStore(input: MergeInput): Promise<void> {
       if (hasBaseline) diffDiaries(input.username, merged.achievementDiaries, input.achievementDiaries, input.timestamp);
       merged.achievementDiaries = input.achievementDiaries;
     }
+    if (input.diaryTaskVarps) merged.diaryTaskVarps = input.diaryTaskVarps;
+    if (input.diaryTaskVarbits) merged.diaryTaskVarbits = input.diaryTaskVarbits;
     if (input.combatAchievements) {
       if (hasBaseline) diffCombatAchievements(input.username, merged.combatAchievements, input.combatAchievements, input.timestamp);
       merged.combatAchievements = input.combatAchievements;

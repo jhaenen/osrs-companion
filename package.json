@@ -10,7 +10,7 @@
     "dist"
   ],
   "scripts": {
-    "build": "tsc",
+    "build": "tsc && mkdir -p dist/data && cp src/data/*.json dist/data/",
     "start": "node dist/index.js",
     "start:ingest": "node dist/ingest.js",
     "dev": "tsx src/index.ts",

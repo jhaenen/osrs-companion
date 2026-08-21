@@ -4,6 +4,7 @@ import { listSyncedPlayers, readSnapshot, SYNC_DIR } from "./snapshotStore.js";
 import { getMetricGain, getMetricHistory, getStateHistory } from "./historyStore.js";
 import { xpForLevel, formatDuration } from "./osrsXp.js";
 import type { PlayerSyncData } from "./schema.js";
+import { getDiaryTaskStatus, listDiaryRegions } from "./diaryTasks.js";
 
 const EPOCH = new Date(0).toISOString();
 
@@ -692,6 +693,79 @@ export function buildServer(): McpServer {
           `  ${name}: Easy=${check(diary.easy)} | Med=${check(diary.medium)} | Hard=${check(diary.hard)} | Elite=${check(diary.elite)}`
         );
       }
+      return { content: [{ type: "text", text: lines.join("\n") }] };
+    }
+  );
+
+  server.tool(
+    "get_diary_tasks",
+    "Get per-task Achievement Diary completion (task name + done/not-done), not just the tier-level summary get_my_diaries gives. " +
+      "Defaults to each region's next incomplete tier; pass `tier` to see a specific tier, or `allTiers` to see everything.",
+    {
+      username: z.string().describe("Player username"),
+      region: z.string().optional().describe("Specific diary region (e.g. 'ARDOUGNE', 'VARROCK'). Omit for all regions."),
+      tier: z.enum(["easy", "medium", "hard", "elite"]).optional().describe("Specific tier. Omit to use the next incomplete tier."),
+      allTiers: z.boolean().optional().describe("Show all 4 tiers instead of just the next incomplete one."),
+    },
+    async ({ username, region, tier, allTiers }) => {
+      const data = await readSnapshot(username);
+      if (!data) {
+        return { content: [{ type: "text", text: `No synced data found for "${username}".` }] };
+      }
+      if (!data.achievementDiaries || !data.diaryTaskVarps) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `No per-task diary data synced for "${username}" yet (needs a recent plugin sync with diary syncing enabled).`,
+            },
+          ],
+        };
+      }
+
+      let regions = Object.keys(data.achievementDiaries);
+      if (region) {
+        const key = region.toUpperCase();
+        regions = regions.filter((r) => r.toUpperCase() === key);
+        if (regions.length === 0) {
+          return {
+            content: [
+              { type: "text", text: `Region "${region}" not found. Available: ${listDiaryRegions().join(", ")}` },
+            ],
+          };
+        }
+      }
+
+      const TIERS = ["easy", "medium", "hard", "elite"] as const;
+      const lines: string[] = [`# ${username}'s Achievement Diary tasks`, freshnessLine(data.lastUpdated)];
+
+      for (const r of regions) {
+        const diary = data.achievementDiaries[r];
+        let tiersToShow: (typeof TIERS)[number][];
+        if (tier) {
+          tiersToShow = [tier];
+        } else if (allTiers) {
+          tiersToShow = [...TIERS];
+        } else {
+          const nextIncomplete = TIERS.find((t) => !diary[t]);
+          tiersToShow = nextIncomplete ? [nextIncomplete] : ["elite"]; // fully complete - show elite as the summary
+        }
+
+        lines.push(`\n## ${r}`);
+        for (const t of tiersToShow) {
+          const tasks = getDiaryTaskStatus(r, t, data.diaryTaskVarps, data.diaryTaskVarbits);
+          if (!tasks) {
+            lines.push(`  ${t}: no per-task data available for this region/tier`);
+            continue;
+          }
+          const doneCount = tasks.filter((x) => x.done).length;
+          lines.push(`  ${t[0].toUpperCase()}${t.slice(1)} (${doneCount}/${tasks.length} done)${diary[t] ? " - TIER COMPLETE" : ""}:`);
+          for (const task of tasks) {
+            lines.push(`    [${task.done ? "x" : " "}] ${task.name}`);
+          }
+        }
+      }
+
       return { content: [{ type: "text", text: lines.join("\n") }] };
     }
   );

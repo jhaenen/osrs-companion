@@ -89,6 +89,13 @@ export const playerSyncDataSchema = z.object({
   equipment: z.record(itemEntrySchema).optional(),
   quests: z.array(questEntrySchema).optional(),
   achievementDiaries: z.record(diaryRegionSchema).optional(),
+  // Raw per-task achievement diary bits, keyed by varplayer/varbit ID
+  // (as strings, since JSON object keys always are). Decoded against
+  // src/data/achievementDiaryTasks.json in diaryTasks.ts, not stored
+  // decoded - see PlayerDataCollector.DIARY_TASK_VARPS/DIARY_TASK_VARBITS
+  // in the plugin for what's actually sent.
+  diaryTaskVarps: z.record(z.number()).optional(),
+  diaryTaskVarbits: z.record(z.number()).optional(),
   combatAchievements: combatAchievementDataSchema.optional(),
 });
 
