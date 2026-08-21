@@ -2,6 +2,7 @@ import type {
   PlayerSyncData,
   QuestEntry,
   BankData,
+  PotionStorageEntry,
   InventoryItem,
   ItemEntry,
   DiaryRegion,
@@ -31,6 +32,7 @@ export interface MergeInput {
   // previous snapshot to produce history rows.
   player?: PlayerSyncData["player"];
   bank?: BankData;
+  potionStorage?: PotionStorageEntry[];
   inventory?: InventoryItem[];
   equipment?: Record<string, ItemEntry>;
   quests?: QuestEntry[];
@@ -182,6 +184,7 @@ export async function mergeAndStore(input: MergeInput): Promise<void> {
   if (input.source === "plugin") {
     if (input.player) merged.player = input.player;
     if (input.bank) merged.bank = input.bank;
+    if (input.potionStorage) merged.potionStorage = input.potionStorage;
     if (input.inventory) merged.inventory = input.inventory;
     if (input.equipment) merged.equipment = input.equipment;
     if (input.quests) {

@@ -116,7 +116,7 @@ In this mode `get_my_*` tools read from `~/.runelite/osrs-companion/`
 |------|-------------|
 | `list_synced_players` | List players with synced data |
 | `get_my_profile` | Full player summary |
-| `get_my_bank` | Search bank contents |
+| `get_my_bank` | Search bank contents, including Potion Storage (its own clearly-labeled section) |
 | `get_my_stats` | Skill levels and XP |
 | `get_my_quests` | Quest completion status |
 | `get_my_equipment` | Currently equipped items |

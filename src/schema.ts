@@ -30,6 +30,17 @@ export const bankDataSchema = z.object({
   tabs: z.array(bankTabSchema),
 });
 
+export const potionStorageEntrySchema = z.object({
+  itemId: z.number(),
+  name: z.string().optional(),
+  // Whole potions at the currently-configured withdraw dose tier - matches
+  // what the in-game Potion Storage interface itself shows.
+  quantity: z.number(),
+  // Total individual doses stored, independent of the withdraw dose tier.
+  doses: z.number(),
+  doseTier: z.number(),
+});
+
 export const questEntrySchema = z.object({
   name: z.string(),
   displayName: z.string(),
@@ -70,6 +81,10 @@ export const playerSyncDataSchema = z.object({
   // snapshot as everything else, per the single-source-of-truth design.
   bossKills: z.record(z.number()).optional(),
   bank: bankDataSchema.optional(),
+  // Potion Storage is a separate bank feature - own field rather than
+  // folded into bank.tabs so callers can always tell regular bank items
+  // and stored potions apart without guessing at a tab index convention.
+  potionStorage: z.array(potionStorageEntrySchema).optional(),
   inventory: z.array(inventoryItemSchema).optional(),
   equipment: z.record(itemEntrySchema).optional(),
   quests: z.array(questEntrySchema).optional(),
@@ -81,6 +96,7 @@ export type PlayerSyncData = z.infer<typeof playerSyncDataSchema>;
 export type ItemEntry = z.infer<typeof itemEntrySchema>;
 export type InventoryItem = z.infer<typeof inventoryItemSchema>;
 export type BankData = z.infer<typeof bankDataSchema>;
+export type PotionStorageEntry = z.infer<typeof potionStorageEntrySchema>;
 export type QuestEntry = z.infer<typeof questEntrySchema>;
 export type DiaryRegion = z.infer<typeof diaryRegionSchema>;
 export type CombatAchievementData = z.infer<typeof combatAchievementDataSchema>;

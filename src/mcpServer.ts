@@ -445,11 +445,11 @@ export function buildServer(): McpServer {
 
   server.tool(
     "get_my_bank",
-    "Search and browse the player's synced bank contents. Supports filtering by item name, bank tab, and minimum quantity.",
+    "Search and browse the player's synced bank contents, including Potion Storage (shown as its own clearly-labeled section, never mixed into the numbered bank tabs since it's a separate storage location). Supports filtering by item name, bank tab, and minimum quantity.",
     {
       username: z.string().describe("Player username"),
       search: z.string().optional().describe("Search term to filter items by name (case-insensitive)"),
-      tab: z.number().optional().describe("Bank tab number to filter (0-indexed)"),
+      tab: z.number().optional().describe("Bank tab number to filter (0-indexed). Does not affect Potion Storage, which has no tab of its own."),
       minQuantity: z.number().optional().describe("Only show items with at least this quantity"),
     },
     async ({ username, search, tab, minQuantity }) => {
@@ -457,7 +457,7 @@ export function buildServer(): McpServer {
       if (!data) {
         return { content: [{ type: "text", text: `No synced data found for "${username}".` }] };
       }
-      if (!data.bank?.tabs) {
+      if (!data.bank?.tabs && !data.potionStorage) {
         return {
           content: [{ type: "text", text: `No bank data synced for "${username}". Open your bank in-game to sync.` }],
         };
@@ -467,29 +467,43 @@ export function buildServer(): McpServer {
       // 0. The known cause (bank placeholders) is filtered at the plugin
       // source now, but this guards against any other stray zero/missing-
       // quantity row reaching here without one showing up as a phantom item.
-      let allItems = data.bank.tabs
+      let allItems = (data.bank?.tabs ?? [])
         .flatMap((t) => t.items.map((item) => ({ ...item, tab: t.tabIndex })))
         .filter((item) => (item.quantity ?? 0) > 0);
+
+      let potionItems = (data.potionStorage ?? []).filter((item) => (item.quantity ?? 0) > 0);
 
       if (search) {
         const term = search.toLowerCase();
         allItems = allItems.filter((item) => (item.name ?? "").toLowerCase().includes(term));
+        potionItems = potionItems.filter((item) => (item.name ?? "").toLowerCase().includes(term));
       }
       if (tab !== undefined) {
         allItems = allItems.filter((item) => item.tab === tab);
       }
       if (minQuantity !== undefined) {
         allItems = allItems.filter((item) => item.quantity >= minQuantity);
+        potionItems = potionItems.filter((item) => item.quantity >= minQuantity);
       }
 
-      if (allItems.length === 0) {
+      if (allItems.length === 0 && potionItems.length === 0) {
         return { content: [{ type: "text", text: `No matching items found in ${username}'s bank.` }] };
       }
 
-      const lines: string[] = [`# ${username}'s Bank — ${allItems.length} items found`, freshnessLine(data.lastUpdated)];
+      const lines: string[] = [
+        `# ${username}'s Bank — ${allItems.length + potionItems.length} items found`,
+        freshnessLine(data.lastUpdated),
+      ];
       for (const item of allItems) {
         const qty = item.quantity > 1 ? ` x${item.quantity.toLocaleString()}` : "";
         lines.push(`  [Tab ${item.tab}] ${item.name}${qty} (ID: ${item.itemId})`);
+      }
+      if (potionItems.length > 0) {
+        lines.push("", "## Potion Storage");
+        for (const item of potionItems) {
+          const qty = item.quantity > 1 ? ` x${item.quantity.toLocaleString()}` : "";
+          lines.push(`  ${item.name}${qty} (${item.doses.toLocaleString()} doses, ID: ${item.itemId})`);
+        }
       }
 
       return { content: [{ type: "text", text: lines.join("\n") }] };
