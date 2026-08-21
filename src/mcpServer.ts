@@ -437,7 +437,7 @@ export function buildServer(): McpServer {
 
       if (search) {
         const term = search.toLowerCase();
-        allItems = allItems.filter((item) => item.name.toLowerCase().includes(term));
+        allItems = allItems.filter((item) => (item.name ?? "").toLowerCase().includes(term));
       }
       if (tab !== undefined) {
         allItems = allItems.filter((item) => item.tab === tab);

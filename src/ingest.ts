@@ -36,6 +36,7 @@ app.post("/snapshot", (req, res) => {
 
   const parsed = playerSyncDataSchema.safeParse(req.body);
   if (!parsed.success) {
+    console.error("Rejected snapshot for", req.body?.player?.username, JSON.stringify(parsed.error.flatten()));
     res.status(400).json({ error: "invalid payload", details: parsed.error.flatten() });
     return;
   }

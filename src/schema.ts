@@ -10,7 +10,9 @@ export const skillEntrySchema = z.object({
 
 export const itemEntrySchema = z.object({
   itemId: z.number(),
-  name: z.string(),
+  // Empty equipment/inventory slots have name = null in Java, which Gson
+  // omits entirely from the JSON rather than serializing null.
+  name: z.string().optional(),
   quantity: z.number(),
 });
 
