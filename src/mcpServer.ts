@@ -312,49 +312,127 @@ function stripBalancedSpan(html: string, className: string): string {
   return result;
 }
 
-// Finds top-level <table>...</table> blocks (depth-aware, so a table is not
-// cut short by a nested one) and swaps each for a placeholder token so later
-// generic tag-stripping doesn't mangle its rows before convertWikiTable runs.
-function extractTopLevelTables(html: string): { html: string; tables: string[] } {
+// A <sup class="reference"> footnote marker's visible label sits between two
+// cite-bracket spans, e.g. <span class="cite-bracket">[</span>d 1<span
+// class="cite-bracket">]</span> - decoded to the literal text "d 1" or "1",
+// which is exactly the label used as the reference list's list-position key
+// below (both entity and literal bracket forms are tolerated defensively).
+const CITE_BRACKET_LABEL_RE =
+  /<span class="cite-bracket">(?:\[|&#91;)<\/span>([\s\S]*?)<span class="cite-bracket">(?:\]|&#93;)<\/span>/;
+const SUP_REFERENCE_RE = /<sup\b[^>]*class="[^"]*reference[^"]*"[^>]*>([\s\S]*?)<\/sup>/g;
+
+// Wiki editors place a `{{Reflist|group=d}}`-style footnote list immediately
+// after the single table it annotates, and each such call independently
+// restarts its own numbering - so "d 1" under one table and "d 1" under
+// another are unrelated notes, even though the labels collide (confirmed
+// against Reward Cart, which has seven independent group="d" lists, one per
+// drop table). Ungrouped <ref> citations, in contrast, collect into one
+// running page-wide list. So: a *grouped* reflist's entries are scoped only
+// to the single table immediately preceding it; an *ungrouped* reflist's
+// entries are page-global fallbacks (used for citation-style refs, not
+// per-item conditions - kept out of inline resolution, see convertWikiTable).
+//
+// Single left-to-right scan so "nearest preceding table" falls out of
+// position order for free, without needing to special-case section
+// boundaries: whichever table's placeholder was most recently emitted is
+// still "current" when the next grouped reflist is found, and a new table
+// simply replaces it.
+function extractTablesAndFootnotes(html: string): {
+  html: string;
+  tables: string[];
+  tableFootnotes: Array<Map<string, string>>;
+  globalFootnotes: Map<string, string>;
+  footnoteBlocks: string[];
+} {
   const tables: string[] = [];
+  const tableFootnotes: Array<Map<string, string>> = [];
+  const globalFootnotes = new Map<string, string>();
+  const footnoteBlocks: string[] = [];
+  let currentTable = -1;
   let result = "";
   let i = 0;
+
   while (i < html.length) {
-    const openIdx = html.indexOf("<table", i);
-    if (openIdx === -1) {
+    const tableIdx = html.indexOf("<table", i);
+    const olIdx = html.indexOf('<ol class="references"', i);
+    const candidates = [tableIdx, olIdx].filter((x) => x !== -1);
+    if (candidates.length === 0) {
       result += html.slice(i);
       break;
     }
-    result += html.slice(i, openIdx);
-    const tagRe = /<table\b|<\/table>/gi;
-    tagRe.lastIndex = openIdx;
-    let depth = 0;
-    let closeIdx = -1;
-    let m: RegExpExecArray | null;
-    while ((m = tagRe.exec(html))) {
-      depth += m[0].toLowerCase().startsWith("<table") ? 1 : -1;
-      if (depth === 0) {
-        closeIdx = m.index + m[0].length;
+    const nextIdx = Math.min(...candidates);
+    result += html.slice(i, nextIdx);
+
+    if (nextIdx === tableIdx) {
+      const tagRe = /<table\b|<\/table>/gi;
+      tagRe.lastIndex = nextIdx;
+      let depth = 0;
+      let closeIdx = -1;
+      let m: RegExpExecArray | null;
+      while ((m = tagRe.exec(html))) {
+        depth += m[0].toLowerCase().startsWith("<table") ? 1 : -1;
+        if (depth === 0) {
+          closeIdx = m.index + m[0].length;
+          break;
+        }
+      }
+      if (closeIdx === -1) {
+        result += html.slice(nextIdx);
         break;
       }
+      tables.push(html.slice(nextIdx, closeIdx));
+      tableFootnotes.push(new Map());
+      currentTable = tables.length - 1;
+      result += ` TABLE${tables.length - 1} `;
+      i = closeIdx;
+    } else {
+      const closeIdx = html.indexOf("</ol>", nextIdx);
+      if (closeIdx === -1) {
+        result += html.slice(nextIdx);
+        break;
+      }
+      const olEnd = closeIdx + "</ol>".length;
+      const olHtml = html.slice(nextIdx, olEnd);
+      const groupMatch = /^<ol class="references"\s+data-mw-group="([^"]*)"/.exec(olHtml);
+      const group = groupMatch ? groupMatch[1] : undefined;
+
+      const liRe = /<li[^>]*>([\s\S]*?)<\/li>/g;
+      const lines: string[] = [];
+      let n = 0;
+      let liMatch: RegExpExecArray | null;
+      while ((liMatch = liRe.exec(olHtml))) {
+        n++;
+        const textMatch = /<span class="reference-text">([\s\S]*?)<\/span>/.exec(liMatch[1]);
+        const label = group ? `${group} ${n}` : String(n);
+        const noteText = htmlFragmentToText(textMatch ? textMatch[1] : liMatch[1]);
+        lines.push(`[${label}] ${noteText}`);
+        if (group && currentTable !== -1) {
+          tableFootnotes[currentTable].set(label, noteText);
+        } else if (!group) {
+          globalFootnotes.set(label, noteText);
+        }
+      }
+      if (lines.length > 0) {
+        footnoteBlocks.push(lines.join("\n"));
+        result += ` FOOTNOTES${footnoteBlocks.length - 1} `;
+      }
+      i = olEnd;
     }
-    if (closeIdx === -1) {
-      result += html.slice(openIdx);
-      break;
-    }
-    tables.push(html.slice(openIdx, closeIdx));
-    result += ` TABLE${tables.length - 1} `;
-    i = closeIdx;
   }
-  return { html: result, tables };
+
+  return { html: result, tables, tableFootnotes, globalFootnotes, footnoteBlocks };
 }
 
 // Renders a wikitable as pipe-delimited rows, one per line, preserving cell
-// order (including any inline footnote markers like "[1]" or "[d 1]", which
-// survive because htmlFragmentToText only strips tags - the literal "[" "]"
-// text the wiki wraps citation numbers in is left alone). Rows with no
-// visible text in any cell (pure layout/spacer rows) are dropped.
-function convertWikiTable(tableHtml: string): string {
+// order. Any footnote marker resolvable against `footnotes` (grouped notes
+// scoped to this table - see extractTablesAndFootnotes) is removed and its
+// text inlined as "value — NOTE: ..." right in the cell, so reading the
+// table doesn't require a second lookup to find and reattach the footnote.
+// Markers that aren't in `footnotes` (ungrouped citation refs, or anything
+// unresolvable) are left as literal "[label]" text via the generic
+// tag-strip fallback, unchanged from before. Rows with no visible text in
+// any cell (pure layout/spacer rows) are dropped.
+function convertWikiTable(tableHtml: string, footnotes: Map<string, string>): string {
   const rows: string[][] = [];
   const trRe = /<tr[^>]*>([\s\S]*?)<\/tr>/g;
   let trMatch: RegExpExecArray | null;
@@ -363,7 +441,18 @@ function convertWikiTable(tableHtml: string): string {
     const cells: string[] = [];
     let cellMatch: RegExpExecArray | null;
     while ((cellMatch = cellRe.exec(trMatch[1]))) {
-      cells.push(htmlFragmentToText(cellMatch[1]));
+      const notes: string[] = [];
+      const resolvedHtml = cellMatch[1].replace(SUP_REFERENCE_RE, (full, supInner: string) => {
+        const labelMatch = CITE_BRACKET_LABEL_RE.exec(supInner);
+        const label = labelMatch ? htmlFragmentToText(labelMatch[1]) : null;
+        const note = label ? footnotes.get(label) : undefined;
+        if (note === undefined) return full;
+        notes.push(note);
+        return "";
+      });
+      let cellText = htmlFragmentToText(resolvedHtml);
+      if (notes.length > 0) cellText += ` — NOTE: ${notes.join(" ")}`;
+      cells.push(cellText);
     }
     if (cells.some((c) => c.length > 0)) rows.push(cells);
   }
@@ -371,31 +460,35 @@ function convertWikiTable(tableHtml: string): string {
   return rows.map((r) => `| ${r.join(" | ")} |`).join("\n");
 }
 
-// OSRS Wiki table footnotes (the load-bearing "unless already have X" /
-// "ties broken by Y" detail that plain-text extraction throws away) render
-// as <ol class="references" data-mw-group="...">, placed right after the
-// table they annotate. Converts each to "[group n] note text" lines, using
-// list position for the number since that's what the inline "[d 1]"-style
-// markers in the table cells reference.
-function convertReferenceLists(html: string): { html: string; footnoteBlocks: string[] } {
-  const footnoteBlocks: string[] = [];
-  const olRe = /<ol class="references"(?:\s+data-mw-group="([^"]*)")?[^>]*>([\s\S]*?)<\/ol>/g;
-  const converted = html.replace(olRe, (_match, group: string | undefined, inner: string) => {
-    const liRe = /<li[^>]*>([\s\S]*?)<\/li>/g;
-    const lines: string[] = [];
-    let n = 0;
-    let liMatch: RegExpExecArray | null;
-    while ((liMatch = liRe.exec(inner))) {
-      n++;
-      const textMatch = /<span class="reference-text">([\s\S]*?)<\/span>/.exec(liMatch[1]);
-      const label = group ? `${group} ${n}` : String(n);
-      lines.push(`[${label}] ${htmlFragmentToText(textMatch ? textMatch[1] : liMatch[1])}`);
+// Finds the resolved text of any grouped footnote attached to itemName's own
+// row, on any table on the page - used to populate dropsline's `conditions`
+// field. Matches by wikilink href rather than visible text (robust to a
+// row's link text differing slightly, e.g. capitalization) and only
+// considers grouped footnotes, so a citation-style ungrouped ref never gets
+// misreported as a drop condition.
+function findItemConditions(html: string, itemName: string): string | null {
+  const { tables, tableFootnotes } = extractTablesAndFootnotes(html);
+  const slug = itemName.trim().replace(/ /g, "_").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const hrefRe = new RegExp(`href="/w/${slug}(?:#[^"]*)?"`, "i");
+  const notes: string[] = [];
+
+  tables.forEach((tableHtml, tableIndex) => {
+    const trRe = /<tr[^>]*>([\s\S]*?)<\/tr>/g;
+    let trMatch: RegExpExecArray | null;
+    while ((trMatch = trRe.exec(tableHtml))) {
+      if (!hrefRe.test(trMatch[1])) continue;
+      SUP_REFERENCE_RE.lastIndex = 0;
+      let supMatch: RegExpExecArray | null;
+      while ((supMatch = SUP_REFERENCE_RE.exec(trMatch[1]))) {
+        const labelMatch = CITE_BRACKET_LABEL_RE.exec(supMatch[1]);
+        const label = labelMatch ? htmlFragmentToText(labelMatch[1]) : null;
+        const note = label ? tableFootnotes[tableIndex].get(label) : undefined;
+        if (note && !notes.includes(note)) notes.push(note);
+      }
     }
-    if (lines.length === 0) return "";
-    footnoteBlocks.push(lines.join("\n"));
-    return ` FOOTNOTES${footnoteBlocks.length - 1} `;
   });
-  return { html: converted, footnoteBlocks };
+
+  return notes.length > 0 ? notes.join(" ") : null;
 }
 
 // Converts the OSRS Wiki's rendered page HTML (action=parse prop=text) to
@@ -409,11 +502,15 @@ function htmlPageToText(html: string): string {
   let work = html.replace(/<!--[\s\S]*?-->/g, "");
   work = stripBalancedSpan(work, "mw-editsection");
 
-  const { html: withoutTables, tables } = extractTopLevelTables(work);
-  const convertedTables = tables.map(convertWikiTable);
-  const { html: withoutRefs, footnoteBlocks } = convertReferenceLists(withoutTables);
+  const { html: withoutTables, tables, tableFootnotes, footnoteBlocks } = extractTablesAndFootnotes(work);
+  // Only grouped footnotes (real conditions/mechanics) get inlined - merging
+  // in the page-wide ungrouped citation list here would glue an unrelated
+  // "video source" blurb onto the same NOTE as an actual gameplay condition.
+  // Ungrouped markers are left as bare "[n]" text; the standalone footnote
+  // block below (unchanged) still carries their text nearby.
+  const convertedTables = tables.map((tableHtml, i) => convertWikiTable(tableHtml, tableFootnotes[i]));
 
-  let text = withoutRefs.replace(
+  let text = withoutTables.replace(
     /<h([2-6])[^>]*>([\s\S]*?)<\/h\1>/g,
     (_m, level: string, inner: string) => `\n\n${"#".repeat(Number(level) - 1)} ${htmlFragmentToText(inner)}\n`
   );
@@ -459,6 +556,26 @@ async function wikiFetch<T>(params: Record<string, string>): Promise<T> {
     if (!res.ok) throw new Error(`Wiki API returned ${res.status}`);
     return res.json() as Promise<T>;
   });
+}
+
+// Shared by wiki_parse_page and dropsline's `conditions` enrichment (both
+// need a page's rendered HTML) so the action=parse fetch + its
+// action=query-incompatible error shape are handled in exactly one place.
+async function fetchPageHtml(title: string): Promise<{ html: string; title: string } | { error: string }> {
+  const data = await wikiFetch<WikiParseResponse>({
+    action: "parse",
+    prop: "text",
+    formatversion: "2",
+    page: title,
+  });
+
+  if (data.error) {
+    return { error: data.error.code === "missingtitle" ? `Page not found: "${title}"` : `Wiki error: ${data.error.info}` };
+  }
+  if (!data.parse?.text) {
+    return { error: `No content available for "${title}"` };
+  }
+  return { html: data.parse.text, title: data.parse.title };
 }
 
 // Bucket/field names are always lowercase with underscores; rejecting
@@ -681,7 +798,7 @@ export function buildServer(): McpServer {
       "exchange (id, name, value, high_alch, low_alch, limit); " +
       "combat_achievement (id, name, monster, task, tier, type). " +
       "Every bucket also accepts an implicit `page_name` filter (the wiki page a row came from), even though it isn't in the bucket's own field list - use `where: { page_name: 'X' }` to fetch every row tied to one page in a single call (e.g. an entire drop table) instead of one call per item_name. " +
-      "CAVEAT for dropsline: its flat `Rarity` field is only correct for independent rolls. Reward tables with a shared/chained roll slot (e.g. Wintertodt's Reward Cart choosing one of several Pyromancer outfit pieces) list each possible item at the same Rarity, which looks like N independent chances but is really one roll split N ways, sometimes with conditional redirects (\"if already have 3, give X instead\") noted only on the wiki page. If multiple dropsline rows from the same page_name share an identical Rarity and a \"Drop type\" of \"reward\", do not treat them as independent - cross-check wiki_parse_page on that page's mechanic/reward-roll section (its table + footnotes carry the real roll order and conditions) before answering.",
+      "dropsline responses always include page_name, item_name, and a `conditions` field regardless of what you selected: `conditions` is auto-resolved from the source page's own drop-table footnotes (a shared/chained roll, a \"redirect to a different item once you already have N\" rule, a tie-break order, etc) and is explicitly `null` when the wiki records no such condition for that row - treat a non-null `conditions` value as load-bearing, not a footnote to skip. Rarity alone is only trustworthy when conditions is null. Enrichment is capped at 5 distinct source pages per call (skipped rows still get `conditions: null`, which is then \"not checked\" rather than \"confirmed none\" - narrow with `where: { page_name: ... }` and re-run if that matters); for anything still unclear after that, wiki_parse_page on the source page has the full table.",
     {
       bucket: z.string().describe("Bucket name, e.g. 'infobox_item', 'infobox_monster', 'dropsline', 'exchange', 'combat_achievement'"),
       select: z.array(z.string()).min(1).describe("Fields to return, e.g. ['item_id', 'examine']"),
@@ -715,7 +832,13 @@ export function buildServer(): McpServer {
         };
       }
 
-      const query = buildBucketQuery(bucketName, fields, whereEntries, limit);
+      const isDropsline = bucketName === "dropsline";
+      // dropsline's `conditions` enrichment (below) needs to correlate each
+      // row back to a spot on its source page, so page_name/item_name are
+      // forced into the query regardless of what the caller selected.
+      const queryFields = isDropsline ? Array.from(new Set([...fields, "page_name", "item_name"])) : fields;
+
+      const query = buildBucketQuery(bucketName, queryFields, whereEntries, limit);
       const data = await wikiFetch<BucketQueryResponse>({ action: "bucket", query });
 
       if (data.error) {
@@ -724,17 +847,43 @@ export function buildServer(): McpServer {
         };
       }
 
-      const rows = data.bucket ?? [];
+      let rows = data.bucket ?? [];
       if (rows.length === 0) {
         return {
           content: [{ type: "text", text: `No rows found for bucket "${bucketName}" with the given fields/filters.\n\nQuery: ${query}` }],
         };
       }
 
-      const dropslineCaveat =
-        bucketName === "dropsline"
-          ? "\n\nCaveat: Rarity here is a flat per-item rate. If several of these rows share the same page and Rarity with \"Drop type\": \"reward\", they may be one shared/chained roll (e.g. \"pick one of these 4 items\"), not independent chances - use wiki_parse_page on the source page to confirm roll order and any conditional footnotes before reporting rates."
-          : "";
+      let dropslineCaveat = "";
+      if (isDropsline) {
+        // Bucket's flat Rarity can't itself represent a shared/chained roll
+        // (see tool description) - the only real fix is reading the source
+        // page's own footnotes, so fetch each distinct page (capped, since
+        // a broad item_name-only query can span many monsters' pages) and
+        // resolve a `conditions` field per row from them.
+        const MAX_CONDITION_PAGES = 5;
+        const distinctPages = Array.from(new Set(rows.map((r) => String(r.page_name ?? "")).filter((p) => p.length > 0)));
+        const pagesToFetch = distinctPages.slice(0, MAX_CONDITION_PAGES);
+
+        const pageHtmlByName = new Map<string, string>();
+        for (const pageName of pagesToFetch) {
+          const result = await fetchPageHtml(pageName);
+          if (!("error" in result)) pageHtmlByName.set(pageName, result.html);
+        }
+
+        rows = rows.map((row) => {
+          const pageHtml = pageHtmlByName.get(String(row.page_name ?? ""));
+          const itemName = String(row.item_name ?? "");
+          const conditions = pageHtml && itemName ? findItemConditions(pageHtml, itemName) : null;
+          return { ...row, conditions };
+        });
+
+        const skippedPages = distinctPages.length - pagesToFetch.length;
+        dropslineCaveat =
+          skippedPages > 0
+            ? `\n\nNote: results span ${distinctPages.length} source pages; conditions were only checked for the first ${MAX_CONDITION_PAGES} (\`conditions: null\` on rows from the other ${skippedPages} page(s) means "not checked", not "confirmed none"). Narrow with where: { page_name: ... } to cover a skipped page.`
+            : "";
+      }
 
       return {
         content: [
@@ -756,36 +905,18 @@ export function buildServer(): McpServer {
       title: z.string().describe("Exact page title (e.g. 'Dragon Slayer I', 'Reward Cart')"),
     },
     async ({ title }) => {
-      const data = await wikiFetch<WikiParseResponse>({
-        action: "parse",
-        prop: "text",
-        formatversion: "2",
-        page: title,
-      });
-
-      if (data.error) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: data.error.code === "missingtitle" ? `Page not found: "${title}"` : `Wiki error: ${data.error.info}`,
-            },
-          ],
-        };
+      const result = await fetchPageHtml(title);
+      if ("error" in result) {
+        return { content: [{ type: "text", text: result.error }] };
       }
 
-      const page = data.parse;
-      if (!page?.text) {
-        return { content: [{ type: "text", text: `No content available for "${title}"` }] };
-      }
-
-      const text = htmlPageToText(page.text);
+      const text = htmlPageToText(result.html);
       if (!text) {
-        return { content: [{ type: "text", text: `No content available for "${page.title}"` }] };
+        return { content: [{ type: "text", text: `No content available for "${result.title}"` }] };
       }
 
       return {
-        content: [{ type: "text", text: `# ${page.title}\n\n${text}\n\n${pageUrl(page.title)}${WIKI_ATTRIBUTION}` }],
+        content: [{ type: "text", text: `# ${result.title}\n\n${text}\n\n${pageUrl(result.title)}${WIKI_ATTRIBUTION}` }],
       };
     }
   );
