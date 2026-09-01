@@ -188,6 +188,18 @@ interface WikiItemMapping {
   [itemId: string]: string;
 }
 
+// Bucket is the OSRS Wiki's structured-data extension (replacing the
+// hard-deprecated Semantic MediaWiki `action=ask`). A successful query
+// returns `bucket`; a malformed one (unknown bucket/field name, bad syntax)
+// still returns HTTP 200 with `error` set instead of failing the request -
+// callers must check `error` explicitly rather than trusting an empty
+// `bucket` array to mean "no results".
+interface BucketQueryResponse {
+  bucketQuery?: string;
+  bucket?: Array<Record<string, unknown>>;
+  error?: string;
+}
+
 interface PriceData {
   high?: number;
   highTime?: number;
@@ -218,11 +230,61 @@ function stripHtml(text: string): string {
   return text.replace(/<[^>]+>/g, "").replace(/&quot;/g, '"').replace(/&amp;/g, "&");
 }
 
+// Serializes all oldschool.runescape.wiki requests (search/summary/bucket/
+// parse alike) to roughly 1/second, per the wiki's request etiquette. A
+// promise-chain queue rather than a fixed interval timer, so a burst of
+// tool calls back-to-back naturally spaces itself out instead of racing.
+let wikiRequestQueue: Promise<void> = Promise.resolve();
+let lastWikiRequestAt = 0;
+const WIKI_MIN_INTERVAL_MS = 1000;
+
+function throttleWiki<T>(fn: () => Promise<T>): Promise<T> {
+  const turn = wikiRequestQueue.then(async () => {
+    const wait = lastWikiRequestAt + WIKI_MIN_INTERVAL_MS - Date.now();
+    if (wait > 0) await new Promise((resolve) => setTimeout(resolve, wait));
+    lastWikiRequestAt = Date.now();
+  });
+  wikiRequestQueue = turn.catch(() => {});
+  return turn.then(fn);
+}
+
 async function wikiFetch<T>(params: Record<string, string>): Promise<T> {
-  const url = `${WIKI_API}?${new URLSearchParams({ format: "json", ...params })}`;
-  const res = await fetch(url, { headers: { "User-Agent": USER_AGENT } });
-  if (!res.ok) throw new Error(`Wiki API returned ${res.status}`);
-  return res.json() as Promise<T>;
+  return throttleWiki(async () => {
+    const url = `${WIKI_API}?${new URLSearchParams({ format: "json", ...params })}`;
+    const res = await fetch(url, { headers: { "User-Agent": USER_AGENT } });
+    if (!res.ok) throw new Error(`Wiki API returned ${res.status}`);
+    return res.json() as Promise<T>;
+  });
+}
+
+// Bucket/field names are always lowercase with underscores; rejecting
+// anything else up front turns a silently-wrong query into a clear error
+// before it ever reaches the wiki.
+const BUCKET_NAME_RE = /^[a-z][a-z0-9_]*$/;
+
+function escapeBucketString(value: string): string {
+  return value.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+}
+
+function formatBucketValue(value: string | number): string {
+  return typeof value === "number" ? String(value) : `'${escapeBucketString(value)}'`;
+}
+
+// Builds a Bucket query string, e.g.
+// bucket('infobox_item').select('item_id','examine').where('item_name','Raw lobster').limit(50).run()
+// Multiple .where() calls are ANDed together (confirmed against the live API).
+function buildBucketQuery(
+  bucketName: string,
+  select: string[],
+  where: Array<[string, string | number]>,
+  limit: number
+): string {
+  const selectArgs = select.map((f) => `'${f}'`).join(",");
+  let query = `bucket('${bucketName}').select(${selectArgs})`;
+  for (const [field, value] of where) {
+    query += `.where('${field}',${formatBucketValue(value)})`;
+  }
+  return `${query}.limit(${limit}).run()`;
 }
 
 async function pricesFetch<T>(path: string): Promise<T> {
@@ -396,6 +458,108 @@ export function buildServer(): McpServer {
       const extract = page.extract?.trim();
       if (!extract) {
         return { content: [{ type: "text", text: `No summary available for "${page.title}"` }] };
+      }
+
+      return {
+        content: [{ type: "text", text: `# ${page.title}\n\n${extract}\n\n${pageUrl(page.title)}${WIKI_ATTRIBUTION}` }],
+      };
+    }
+  );
+
+  server.tool(
+    "wiki_query",
+    "Query the OSRS Wiki's structured data (Bucket API) for precise facts: drop rates, monster combat stats, item stats/examine text, GE metadata, combat achievement tasks. " +
+      "Prefer this over `summary` or `wiki_parse_page` whenever the fact in question is structured data, since prose parsing risks misreading. " +
+      "Known buckets and a few of their fields (schemas aren't exhaustively documented - if a field name is rejected by the wiki, try common variants or fall back to wiki_parse_page): " +
+      "infobox_item (item_name, item_id, examine, value, high_alchemy_value, weight, tradeable, buy_limit); " +
+      "infobox_monster (name, combat_level, hitpoints, max_hit, attack_level, strength_level, defence_level, ranged_level, magic_level, slayer_level, slayer_category); " +
+      "dropsline (page_name, item_name, drop_json - drop_json is a JSON string with Rarity, Drop Quantity, Dropped item, Dropped from, Rolls, etc, one row per drop); " +
+      "exchange (id, name, value, high_alch, low_alch, limit); " +
+      "combat_achievement (id, name, monster, task, tier, type).",
+    {
+      bucket: z.string().describe("Bucket name, e.g. 'infobox_item', 'infobox_monster', 'dropsline', 'exchange', 'combat_achievement'"),
+      select: z.array(z.string()).min(1).describe("Fields to return, e.g. ['item_id', 'examine']"),
+      where: z
+        .record(z.union([z.string(), z.number()]))
+        .optional()
+        .describe("Equality filters as field -> value, e.g. { item_name: 'Raw lobster' }. Multiple entries are ANDed together."),
+      limit: z.number().min(1).max(500).default(50).describe("Max rows to return (1-500)"),
+    },
+    async ({ bucket, select, where, limit }) => {
+      const bucketName = bucket.trim().toLowerCase();
+      if (!BUCKET_NAME_RE.test(bucketName)) {
+        return {
+          content: [{ type: "text", text: `Invalid bucket name: "${bucket}". Bucket names are lowercase with underscores, e.g. "infobox_item".` }],
+        };
+      }
+
+      const fields = select.map((f) => f.trim().toLowerCase());
+      const badField = fields.find((f) => !BUCKET_NAME_RE.test(f));
+      if (badField) {
+        return {
+          content: [{ type: "text", text: `Invalid field name: "${badField}". Field names are lowercase with underscores.` }],
+        };
+      }
+
+      const whereEntries = Object.entries(where ?? {}).map(([k, v]) => [k.trim().toLowerCase(), v] as [string, string | number]);
+      const badWhereField = whereEntries.find(([k]) => !BUCKET_NAME_RE.test(k));
+      if (badWhereField) {
+        return {
+          content: [{ type: "text", text: `Invalid filter field name: "${badWhereField[0]}". Field names are lowercase with underscores.` }],
+        };
+      }
+
+      const query = buildBucketQuery(bucketName, fields, whereEntries, limit);
+      const data = await wikiFetch<BucketQueryResponse>({ action: "bucket", query });
+
+      if (data.error) {
+        return {
+          content: [{ type: "text", text: `Bucket query error: ${data.error}\n\nQuery: ${data.bucketQuery ?? query}` }],
+        };
+      }
+
+      const rows = data.bucket ?? [];
+      if (rows.length === 0) {
+        return {
+          content: [{ type: "text", text: `No rows found for bucket "${bucketName}" with the given fields/filters.\n\nQuery: ${query}` }],
+        };
+      }
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Found ${rows.length} row(s) from bucket "${bucketName}":\n\n\`\`\`json\n${JSON.stringify(rows, null, 2)}\n\`\`\`${WIKI_ATTRIBUTION}`,
+          },
+        ],
+      };
+    }
+  );
+
+  server.tool(
+    "wiki_parse_page",
+    "Get the full text of an OSRS Wiki page (every section, not just the intro `summary` gives). Use for quest guides, mechanics writeups, and strategy content not covered by wiki_query's structured data. " +
+      "Prefer wiki_query instead whenever the fact in question is structured data (drop rates, stats, prices) - prose parsing here risks the same misreading problem `summary` has today, just with more text to misread.",
+    {
+      title: z.string().describe("Exact page title (e.g. 'Dragon Slayer I', 'Zulrah/Strategies')"),
+    },
+    async ({ title }) => {
+      const data = await wikiFetch<WikiPageResponse>({
+        action: "query",
+        prop: "extracts",
+        explaintext: "1",
+        formatversion: "2",
+        titles: title,
+      });
+
+      const page = data.query?.pages?.[0];
+      if (!page || page.missing) {
+        return { content: [{ type: "text", text: `Page not found: "${title}"` }] };
+      }
+
+      const extract = page.extract?.trim();
+      if (!extract) {
+        return { content: [{ type: "text", text: `No content available for "${page.title}"` }] };
       }
 
       return {
