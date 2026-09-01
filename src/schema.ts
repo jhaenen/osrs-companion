@@ -70,11 +70,13 @@ export const collectionLogCategoryCountSchema = z.object({
 // No bulk "every unlocked item ever" API exists in the client (see the
 // plugin's PlayerSyncData.CollectionLogData javadoc) - total/categories are
 // cheap, always-in-sync varp-derived counts, while obtainedItems is a
-// best-effort, ever-growing set of item names actually observed unlocked
-// via the "New item added to your collection log" chat message, only while
-// the client is running and listening. Never treat obtainedItems as
-// exhaustive - it can also be seeded manually, once, by a full collection-
-// log export action outside this plugin's own control (see the javadoc).
+// best-effort, ever-growing set of item names actually observed unlocked,
+// from two passive sources: the "New item added to your collection log"
+// chat message (only while the client is running and listening), and a
+// clientscript that only fires when an external full collection-log
+// export action (e.g. weirdgloop/WikiSync's own "sync" button) happens to
+// run while the plugin is also listening - this plugin cannot trigger that
+// itself. Never treat obtainedItems as exhaustive.
 export const collectionLogDataSchema = z.object({
   total: collectionLogCategoryCountSchema,
   categories: z.record(collectionLogCategoryCountSchema),
