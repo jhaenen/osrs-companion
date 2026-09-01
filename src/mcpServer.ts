@@ -184,6 +184,21 @@ interface WikiPageResponse {
   };
 }
 
+// action=parse's error shape differs from action=query's - a missing page
+// is a top-level `error.code === "missingtitle"`, not a `pages[].missing`
+// flag like action=query returns.
+interface WikiParseResponse {
+  parse?: {
+    title: string;
+    pageid: number;
+    text: string;
+  };
+  error?: {
+    code: string;
+    info: string;
+  };
+}
+
 interface WikiItemMapping {
   [itemId: string]: string;
 }
@@ -228,6 +243,195 @@ function pageUrl(title: string): string {
 
 function stripHtml(text: string): string {
   return text.replace(/<[^>]+>/g, "").replace(/&quot;/g, '"').replace(/&amp;/g, "&");
+}
+
+const HTML_NAMED_ENTITIES: Record<string, string> = {
+  amp: "&",
+  lt: "<",
+  gt: ">",
+  quot: '"',
+  apos: "'",
+  nbsp: " ",
+  ndash: "–",
+  mdash: "—",
+  hellip: "…",
+  rsquo: "’",
+  lsquo: "‘",
+  rdquo: "”",
+  ldquo: "“",
+  minus: "−",
+};
+
+function decodeHtmlEntities(text: string): string {
+  return text
+    .replace(/&#x([0-9a-fA-F]+);/g, (_m, hex) => String.fromCodePoint(parseInt(hex, 16)))
+    .replace(/&#(\d+);/g, (_m, dec) => String.fromCodePoint(Number(dec)))
+    .replace(/&([a-zA-Z]+);/g, (m, name) => HTML_NAMED_ENTITIES[name] ?? m);
+}
+
+function htmlFragmentToText(fragment: string): string {
+  return decodeHtmlEntities(fragment.replace(/<[^>]+>/g, ""))
+    .replace(/[ \t]+/g, " ")
+    .trim();
+}
+
+// Removes every <span class="{className}">...</span> block, counting nested
+// <span> depth rather than stopping at the first </span> - editsection spans
+// ("[edit | edit source]") nest a bracket span inside, so a naive non-greedy
+// regex only eats the opening bracket and leaks "edit | edit source]" as
+// visible text once tags are stripped.
+function stripBalancedSpan(html: string, className: string): string {
+  const openMarker = `<span class="${className}">`;
+  let result = "";
+  let i = 0;
+  while (i < html.length) {
+    const openIdx = html.indexOf(openMarker, i);
+    if (openIdx === -1) {
+      result += html.slice(i);
+      break;
+    }
+    result += html.slice(i, openIdx);
+    const tagRe = /<span\b[^>]*>|<\/span>/gi;
+    tagRe.lastIndex = openIdx;
+    let depth = 0;
+    let closeIdx = -1;
+    let m: RegExpExecArray | null;
+    while ((m = tagRe.exec(html))) {
+      depth += m[0].toLowerCase().startsWith("<span") ? 1 : -1;
+      if (depth === 0) {
+        closeIdx = m.index + m[0].length;
+        break;
+      }
+    }
+    if (closeIdx === -1) {
+      result += html.slice(openIdx);
+      break;
+    }
+    i = closeIdx;
+  }
+  return result;
+}
+
+// Finds top-level <table>...</table> blocks (depth-aware, so a table is not
+// cut short by a nested one) and swaps each for a placeholder token so later
+// generic tag-stripping doesn't mangle its rows before convertWikiTable runs.
+function extractTopLevelTables(html: string): { html: string; tables: string[] } {
+  const tables: string[] = [];
+  let result = "";
+  let i = 0;
+  while (i < html.length) {
+    const openIdx = html.indexOf("<table", i);
+    if (openIdx === -1) {
+      result += html.slice(i);
+      break;
+    }
+    result += html.slice(i, openIdx);
+    const tagRe = /<table\b|<\/table>/gi;
+    tagRe.lastIndex = openIdx;
+    let depth = 0;
+    let closeIdx = -1;
+    let m: RegExpExecArray | null;
+    while ((m = tagRe.exec(html))) {
+      depth += m[0].toLowerCase().startsWith("<table") ? 1 : -1;
+      if (depth === 0) {
+        closeIdx = m.index + m[0].length;
+        break;
+      }
+    }
+    if (closeIdx === -1) {
+      result += html.slice(openIdx);
+      break;
+    }
+    tables.push(html.slice(openIdx, closeIdx));
+    result += ` TABLE${tables.length - 1} `;
+    i = closeIdx;
+  }
+  return { html: result, tables };
+}
+
+// Renders a wikitable as pipe-delimited rows, one per line, preserving cell
+// order (including any inline footnote markers like "[1]" or "[d 1]", which
+// survive because htmlFragmentToText only strips tags - the literal "[" "]"
+// text the wiki wraps citation numbers in is left alone). Rows with no
+// visible text in any cell (pure layout/spacer rows) are dropped.
+function convertWikiTable(tableHtml: string): string {
+  const rows: string[][] = [];
+  const trRe = /<tr[^>]*>([\s\S]*?)<\/tr>/g;
+  let trMatch: RegExpExecArray | null;
+  while ((trMatch = trRe.exec(tableHtml))) {
+    const cellRe = /<t[hd][^>]*>([\s\S]*?)<\/t[hd]>/g;
+    const cells: string[] = [];
+    let cellMatch: RegExpExecArray | null;
+    while ((cellMatch = cellRe.exec(trMatch[1]))) {
+      cells.push(htmlFragmentToText(cellMatch[1]));
+    }
+    if (cells.some((c) => c.length > 0)) rows.push(cells);
+  }
+  if (rows.length === 0) return "";
+  return rows.map((r) => `| ${r.join(" | ")} |`).join("\n");
+}
+
+// OSRS Wiki table footnotes (the load-bearing "unless already have X" /
+// "ties broken by Y" detail that plain-text extraction throws away) render
+// as <ol class="references" data-mw-group="...">, placed right after the
+// table they annotate. Converts each to "[group n] note text" lines, using
+// list position for the number since that's what the inline "[d 1]"-style
+// markers in the table cells reference.
+function convertReferenceLists(html: string): { html: string; footnoteBlocks: string[] } {
+  const footnoteBlocks: string[] = [];
+  const olRe = /<ol class="references"(?:\s+data-mw-group="([^"]*)")?[^>]*>([\s\S]*?)<\/ol>/g;
+  const converted = html.replace(olRe, (_match, group: string | undefined, inner: string) => {
+    const liRe = /<li[^>]*>([\s\S]*?)<\/li>/g;
+    const lines: string[] = [];
+    let n = 0;
+    let liMatch: RegExpExecArray | null;
+    while ((liMatch = liRe.exec(inner))) {
+      n++;
+      const textMatch = /<span class="reference-text">([\s\S]*?)<\/span>/.exec(liMatch[1]);
+      const label = group ? `${group} ${n}` : String(n);
+      lines.push(`[${label}] ${htmlFragmentToText(textMatch ? textMatch[1] : liMatch[1])}`);
+    }
+    if (lines.length === 0) return "";
+    footnoteBlocks.push(lines.join("\n"));
+    return ` FOOTNOTES${footnoteBlocks.length - 1} `;
+  });
+  return { html: converted, footnoteBlocks };
+}
+
+// Converts the OSRS Wiki's rendered page HTML (action=parse prop=text) to
+// plain text, keeping tables (as pipe-delimited rows) and footnotes (as
+// "[n] text" lines right where the wiki places them) instead of dropping
+// them the way TextExtracts-based plain text does. That table/footnote
+// content is exactly where chained-roll mechanics and conditional edge
+// cases live on this wiki, so losing it silently produces confidently
+// wrong answers about drop/reward mechanics.
+function htmlPageToText(html: string): string {
+  let work = html.replace(/<!--[\s\S]*?-->/g, "");
+  work = stripBalancedSpan(work, "mw-editsection");
+
+  const { html: withoutTables, tables } = extractTopLevelTables(work);
+  const convertedTables = tables.map(convertWikiTable);
+  const { html: withoutRefs, footnoteBlocks } = convertReferenceLists(withoutTables);
+
+  let text = withoutRefs.replace(
+    /<h([2-6])[^>]*>([\s\S]*?)<\/h\1>/g,
+    (_m, level: string, inner: string) => `\n\n${"#".repeat(Number(level) - 1)} ${htmlFragmentToText(inner)}\n`
+  );
+  text = text.replace(/<\/p>/g, "\n\n").replace(/<br\s*\/?>/g, "\n");
+  text = text.replace(/<li[^>]*>/g, "\n- ").replace(/<\/li>/g, "");
+  text = text.replace(/<[^>]+>/g, "");
+  text = decodeHtmlEntities(text);
+
+  text = text.replace(/ TABLE(\d+) /g, (_m, i: string) => {
+    const converted = convertedTables[Number(i)];
+    return converted ? `\n${converted}\n` : "";
+  });
+  text = text.replace(/ FOOTNOTES(\d+) /g, (_m, i: string) => `\n${footnoteBlocks[Number(i)]}\n`);
+
+  return text
+    .replace(/[ \t]+\n/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
 }
 
 // Serializes all oldschool.runescape.wiki requests (search/summary/bucket/
@@ -475,7 +679,9 @@ export function buildServer(): McpServer {
       "infobox_monster (name, combat_level, hitpoints, max_hit, attack_level, strength_level, defence_level, ranged_level, magic_level, slayer_level, slayer_category); " +
       "dropsline (page_name, item_name, drop_json - drop_json is a JSON string with Rarity, Drop Quantity, Dropped item, Dropped from, Rolls, etc, one row per drop); " +
       "exchange (id, name, value, high_alch, low_alch, limit); " +
-      "combat_achievement (id, name, monster, task, tier, type).",
+      "combat_achievement (id, name, monster, task, tier, type). " +
+      "Every bucket also accepts an implicit `page_name` filter (the wiki page a row came from), even though it isn't in the bucket's own field list - use `where: { page_name: 'X' }` to fetch every row tied to one page in a single call (e.g. an entire drop table) instead of one call per item_name. " +
+      "CAVEAT for dropsline: its flat `Rarity` field is only correct for independent rolls. Reward tables with a shared/chained roll slot (e.g. Wintertodt's Reward Cart choosing one of several Pyromancer outfit pieces) list each possible item at the same Rarity, which looks like N independent chances but is really one roll split N ways, sometimes with conditional redirects (\"if already have 3, give X instead\") noted only on the wiki page. If multiple dropsline rows from the same page_name share an identical Rarity and a \"Drop type\" of \"reward\", do not treat them as independent - cross-check wiki_parse_page on that page's mechanic/reward-roll section (its table + footnotes carry the real roll order and conditions) before answering.",
     {
       bucket: z.string().describe("Bucket name, e.g. 'infobox_item', 'infobox_monster', 'dropsline', 'exchange', 'combat_achievement'"),
       select: z.array(z.string()).min(1).describe("Fields to return, e.g. ['item_id', 'examine']"),
@@ -525,11 +731,16 @@ export function buildServer(): McpServer {
         };
       }
 
+      const dropslineCaveat =
+        bucketName === "dropsline"
+          ? "\n\nCaveat: Rarity here is a flat per-item rate. If several of these rows share the same page and Rarity with \"Drop type\": \"reward\", they may be one shared/chained roll (e.g. \"pick one of these 4 items\"), not independent chances - use wiki_parse_page on the source page to confirm roll order and any conditional footnotes before reporting rates."
+          : "";
+
       return {
         content: [
           {
             type: "text",
-            text: `Found ${rows.length} row(s) from bucket "${bucketName}":\n\n\`\`\`json\n${JSON.stringify(rows, null, 2)}\n\`\`\`${WIKI_ATTRIBUTION}`,
+            text: `Found ${rows.length} row(s) from bucket "${bucketName}":\n\n\`\`\`json\n${JSON.stringify(rows, null, 2)}\n\`\`\`${dropslineCaveat}${WIKI_ATTRIBUTION}`,
           },
         ],
       };
@@ -538,32 +749,43 @@ export function buildServer(): McpServer {
 
   server.tool(
     "wiki_parse_page",
-    "Get the full text of an OSRS Wiki page (every section, not just the intro `summary` gives). Use for quest guides, mechanics writeups, and strategy content not covered by wiki_query's structured data. " +
-      "Prefer wiki_query instead whenever the fact in question is structured data (drop rates, stats, prices) - prose parsing here risks the same misreading problem `summary` has today, just with more text to misread.",
+    "Get the full text of an OSRS Wiki page (every section, not just the intro `summary` gives), including tables (rendered as pipe-delimited rows) and footnotes (rendered as \"[n] note text\" lines directly after the table they annotate). " +
+      "Use for quest guides, mechanics writeups, reward/drop-roll tables, and strategy content not covered by wiki_query's structured data. Footnotes are frequently where the non-obvious edge cases live (conditional redirects, tie-breaks, \"unless already have X\") - do not skip them when a table is present. " +
+      "Prefer wiki_query instead whenever the fact in question is plain structured data (a single item's stats, a monster's combat level) with no shared/conditional mechanic involved.",
     {
-      title: z.string().describe("Exact page title (e.g. 'Dragon Slayer I', 'Zulrah/Strategies')"),
+      title: z.string().describe("Exact page title (e.g. 'Dragon Slayer I', 'Reward Cart')"),
     },
     async ({ title }) => {
-      const data = await wikiFetch<WikiPageResponse>({
-        action: "query",
-        prop: "extracts",
-        explaintext: "1",
+      const data = await wikiFetch<WikiParseResponse>({
+        action: "parse",
+        prop: "text",
         formatversion: "2",
-        titles: title,
+        page: title,
       });
 
-      const page = data.query?.pages?.[0];
-      if (!page || page.missing) {
-        return { content: [{ type: "text", text: `Page not found: "${title}"` }] };
+      if (data.error) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: data.error.code === "missingtitle" ? `Page not found: "${title}"` : `Wiki error: ${data.error.info}`,
+            },
+          ],
+        };
       }
 
-      const extract = page.extract?.trim();
-      if (!extract) {
+      const page = data.parse;
+      if (!page?.text) {
+        return { content: [{ type: "text", text: `No content available for "${title}"` }] };
+      }
+
+      const text = htmlPageToText(page.text);
+      if (!text) {
         return { content: [{ type: "text", text: `No content available for "${page.title}"` }] };
       }
 
       return {
-        content: [{ type: "text", text: `# ${page.title}\n\n${extract}\n\n${pageUrl(page.title)}${WIKI_ATTRIBUTION}` }],
+        content: [{ type: "text", text: `# ${page.title}\n\n${text}\n\n${pageUrl(page.title)}${WIKI_ATTRIBUTION}` }],
       };
     }
   );
