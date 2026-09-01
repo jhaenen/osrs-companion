@@ -71,8 +71,10 @@ export const collectionLogCategoryCountSchema = z.object({
 // plugin's PlayerSyncData.CollectionLogData javadoc) - total/categories are
 // cheap, always-in-sync varp-derived counts, while obtainedItems is a
 // best-effort, ever-growing set of item names actually observed unlocked
-// (via chat message or the log's own item-population clientscript). Never
-// treat obtainedItems as exhaustive.
+// via the "New item added to your collection log" chat message, only while
+// the client is running and listening. Never treat obtainedItems as
+// exhaustive - it can also be seeded manually, once, by a full collection-
+// log export action outside this plugin's own control (see the javadoc).
 export const collectionLogDataSchema = z.object({
   total: collectionLogCategoryCountSchema,
   categories: z.record(collectionLogCategoryCountSchema),

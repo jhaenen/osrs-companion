@@ -1219,7 +1219,7 @@ export function buildServer(): McpServer {
 
   server.tool(
     "collection_log_completed_since",
-    "Get Collection Log progress over a time range in one call - completion count gained per category (Bosses/Raids/Clues/Minigames/Other) computed from stored history, plus item names newly observed as obtained, alongside current totals. The category counts are authoritative (RuneLite exposes them as always-in-sync varps, no widget interaction needed). The item name list is best-effort only - RuneLite has no bulk 'every unlocked item' API, so names come from a chat message on unlock or the log's own clientscript firing while a page happens to be open in-game; treat a short or empty item list as 'nothing observed', not 'nothing happened', and prefer the category counts to judge real progress.",
+    "Get Collection Log progress over a time range in one call - completion count gained per category (Bosses/Raids/Clues/Minigames/Other) computed from stored history, plus item names newly observed as obtained, alongside current totals. The category counts are authoritative (RuneLite exposes them as always-in-sync varps, no widget interaction needed). The item name list is best-effort only - RuneLite has no bulk 'every unlocked item' API, so names come only from the unlock chat message while the client is running and listening (occasionally supplemented by a one-off manual backfill outside the plugin's control); treat a short or empty item list as 'nothing observed', not 'nothing happened', and prefer the category counts to judge real progress.",
     {
       username: z.string().describe("Player username"),
       since: z.string().optional().describe("ISO 8601 start of the range. Defaults to 7 days ago."),
