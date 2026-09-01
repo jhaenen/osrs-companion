@@ -62,6 +62,23 @@ export const combatAchievementDataSchema = z.object({
   completedTasks: z.array(z.string()),
 });
 
+export const collectionLogCategoryCountSchema = z.object({
+  completed: z.number(),
+  possible: z.number(),
+});
+
+// No bulk "every unlocked item ever" API exists in the client (see the
+// plugin's PlayerSyncData.CollectionLogData javadoc) - total/categories are
+// cheap, always-in-sync varp-derived counts, while obtainedItems is a
+// best-effort, ever-growing set of item names actually observed unlocked
+// (via chat message or the log's own item-population clientscript). Never
+// treat obtainedItems as exhaustive.
+export const collectionLogDataSchema = z.object({
+  total: collectionLogCategoryCountSchema,
+  categories: z.record(collectionLogCategoryCountSchema),
+  obtainedItems: z.array(z.string()),
+});
+
 // Per-category fields are optional: the plugin omits any category a user
 // has toggled off in its config, and Gson skips null fields on write.
 export const playerSyncDataSchema = z.object({
@@ -97,6 +114,7 @@ export const playerSyncDataSchema = z.object({
   diaryTaskVarps: z.record(z.number()).optional(),
   diaryTaskVarbits: z.record(z.number()).optional(),
   combatAchievements: combatAchievementDataSchema.optional(),
+  collectionLog: collectionLogDataSchema.optional(),
 });
 
 export type PlayerSyncData = z.infer<typeof playerSyncDataSchema>;
@@ -107,3 +125,5 @@ export type PotionStorageEntry = z.infer<typeof potionStorageEntrySchema>;
 export type QuestEntry = z.infer<typeof questEntrySchema>;
 export type DiaryRegion = z.infer<typeof diaryRegionSchema>;
 export type CombatAchievementData = z.infer<typeof combatAchievementDataSchema>;
+export type CollectionLogCategoryCount = z.infer<typeof collectionLogCategoryCountSchema>;
+export type CollectionLogData = z.infer<typeof collectionLogDataSchema>;

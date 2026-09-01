@@ -148,6 +148,8 @@ empty range returns a clean "no changes" message rather than an error.
 | `diary_history` | Achievement diary tier completions over a period |
 | `combat_achievements_completed_since` | Task/tier completion summary over a period, plus current tier status |
 | `combat_achievement_history` | Combat achievement task/tier completions over a period |
+| `collection_log_completed_since` | Per-category completion counts gained over a period, plus best-effort item names observed unlocked |
+| `collection_log_history` | Collection log item unlocks observed over a period |
 
 `skill_xp_gained` and `skill_xp_timeline` accept either a skill name (e.g.
 `COOKING`) or a Wise Old Man boss/activity metric name (e.g. `zulrah`,

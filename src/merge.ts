@@ -7,6 +7,8 @@ import type {
   ItemEntry,
   DiaryRegion,
   CombatAchievementData,
+  CollectionLogData,
+  CollectionLogCategoryCount,
 } from "./schema.js";
 import { readSnapshot, writeSnapshot } from "./snapshotStore.js";
 import { recordMetricChange, recordStateChange, type MetricSource } from "./historyStore.js";
@@ -43,6 +45,7 @@ export interface MergeInput {
   diaryTaskVarps?: Record<string, number>;
   diaryTaskVarbits?: Record<string, number>;
   combatAchievements?: CombatAchievementData;
+  collectionLog?: CollectionLogData;
 }
 
 function mergeSkills(
@@ -165,6 +168,69 @@ function diffCombatAchievements(
   }
 }
 
+// Collection log completion counts are monotonic numbers exactly like
+// bossKills' kill counts (varp-derived, always the current total, never a
+// delta) - merged the same way: max() per key, with a metric_history row
+// only once a *previous* value exists. A veteran player's very first sync
+// already has a large existing completed count; treating "never recorded"
+// as a baseline of 0 would write a fake "0 -> N" row, the exact mistake
+// mergeBossKills' comment warns about. `possible` isn't part of that
+// monotonic story (it only grows when Jagex adds log content) so it's just
+// always taken from the latest snapshot, independent of the completed-count
+// gate below.
+function mergeCollectionLogCount(
+  username: string,
+  metricKey: string,
+  prev: CollectionLogCategoryCount | undefined,
+  incoming: CollectionLogCategoryCount,
+  source: MetricSource,
+  timestamp: string
+): CollectionLogCategoryCount {
+  if (!prev) {
+    return incoming;
+  }
+  if (incoming.completed > prev.completed) {
+    recordMetricChange(username, metricKey, prev.completed, incoming.completed, source, timestamp);
+  }
+  return { completed: Math.max(prev.completed, incoming.completed), possible: incoming.possible };
+}
+
+function mergeCollectionLogCounts(
+  username: string,
+  existing: CollectionLogData | undefined,
+  incoming: CollectionLogData,
+  source: MetricSource,
+  timestamp: string
+): { total: CollectionLogCategoryCount; categories: Record<string, CollectionLogCategoryCount> } {
+  const total = mergeCollectionLogCount(username, "clog:total", existing?.total, incoming.total, source, timestamp);
+  const categories: Record<string, CollectionLogCategoryCount> = { ...(existing?.categories ?? {}) };
+  for (const [category, count] of Object.entries(incoming.categories)) {
+    categories[category] = mergeCollectionLogCount(
+      username,
+      `clog:${category}`,
+      existing?.categories?.[category],
+      count,
+      source,
+      timestamp
+    );
+  }
+  return { total, categories };
+}
+
+// obtainedItems is a flat, best-effort set (see schema.ts's comment) - the
+// plugin's local copy resets on client/plugin restart, so incoming can be a
+// *subset* of what's already known. Diffing/recording only fires for names
+// genuinely new to the stored set; the caller unions rather than overwrites
+// so a restart never forgets a previously-observed item.
+function diffCollectionLogItems(username: string, existingItems: string[] | undefined, incomingItems: string[], timestamp: string): void {
+  const prev = new Set(existingItems ?? []);
+  for (const item of incomingItems) {
+    if (!prev.has(item)) {
+      recordStateChange(username, "collection_log", item, "not_owned", "owned", timestamp);
+    }
+  }
+}
+
 export async function mergeAndStore(input: MergeInput): Promise<void> {
   const existing = await readSnapshot(input.username);
   // First-ever sync for this player has nothing to diff quests/diaries/CAs
@@ -205,6 +271,22 @@ export async function mergeAndStore(input: MergeInput): Promise<void> {
     if (input.combatAchievements) {
       if (hasBaseline) diffCombatAchievements(input.username, merged.combatAchievements, input.combatAchievements, input.timestamp);
       merged.combatAchievements = input.combatAchievements;
+    }
+    if (input.collectionLog) {
+      const { total, categories } = mergeCollectionLogCounts(
+        input.username,
+        merged.collectionLog,
+        input.collectionLog,
+        input.source,
+        input.timestamp
+      );
+      const existingItems = merged.collectionLog?.obtainedItems ?? [];
+      if (hasBaseline) diffCollectionLogItems(input.username, existingItems, input.collectionLog.obtainedItems, input.timestamp);
+      merged.collectionLog = {
+        total,
+        categories,
+        obtainedItems: Array.from(new Set([...existingItems, ...input.collectionLog.obtainedItems])),
+      };
     }
   }
 

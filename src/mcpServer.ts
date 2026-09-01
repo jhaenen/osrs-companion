@@ -1217,5 +1217,75 @@ export function buildServer(): McpServer {
     }
   );
 
+  server.tool(
+    "collection_log_completed_since",
+    "Get Collection Log progress over a time range in one call - completion count gained per category (Bosses/Raids/Clues/Minigames/Other) computed from stored history, plus item names newly observed as obtained, alongside current totals. The category counts are authoritative (RuneLite exposes them as always-in-sync varps, no widget interaction needed). The item name list is best-effort only - RuneLite has no bulk 'every unlocked item' API, so names come from a chat message on unlock or the log's own clientscript firing while a page happens to be open in-game; treat a short or empty item list as 'nothing observed', not 'nothing happened', and prefer the category counts to judge real progress.",
+    {
+      username: z.string().describe("Player username"),
+      since: z.string().optional().describe("ISO 8601 start of the range. Defaults to 7 days ago."),
+      until: z.string().optional().describe("ISO 8601 end of the range. Defaults to now."),
+    },
+    async ({ username, since, until }) => {
+      const data = await readSnapshot(username);
+      if (!data) return { content: [{ type: "text", text: `No synced data found for "${username}".` }] };
+      if (!data.collectionLog) return { content: [{ type: "text", text: `No collection log data synced for "${username}".` }] };
+
+      const sinceIso = since ?? new Date(Date.now() - 7 * 24 * 3600 * 1000).toISOString();
+      const untilIso = until ?? new Date().toISOString();
+
+      const totalGain = getMetricGain(username, "clog:total", sinceIso, untilIso);
+      const categoryGains = Object.entries(data.collectionLog.categories).map(([name, current]) => ({
+        name,
+        current,
+        gain: getMetricGain(username, `clog:${name}`, sinceIso, untilIso),
+      }));
+
+      const itemRows = getStateHistory(username, "collection_log", sinceIso, untilIso).filter((r) => r.newState === "owned");
+
+      const lines: string[] = [
+        `# ${username} — Collection Log progress since ${sinceIso}`,
+        `${sinceIso} → ${untilIso}`,
+        `Total: ${data.collectionLog.total.completed}/${data.collectionLog.total.possible} (+${totalGain} in this period)`,
+        "",
+        "## Categories",
+      ];
+      for (const { name, current, gain } of categoryGains) {
+        lines.push(`  ${name}: ${current.completed}/${current.possible} (+${gain} in this period)`);
+      }
+
+      lines.push("", `Items newly observed as obtained in this period: ${itemRows.length}`);
+      if (itemRows.length > 0 && itemRows.length <= 100) {
+        for (const row of itemRows) {
+          lines.push(`  - ${row.itemName} (${row.timestamp})`);
+        }
+      } else if (itemRows.length > 100) {
+        lines.push(`Too many to list individually.`);
+      }
+
+      return { content: [{ type: "text", text: lines.join("\n") }] };
+    }
+  );
+
+  server.tool(
+    "collection_log_history",
+    "Get collection log item unlocks observed for a player over a date range. Defaults to all recorded history. Best-effort only - see collection_log_completed_since for the caveat on why this isn't a complete list of everything unlocked in the window.",
+    {
+      username: z.string().describe("Player username"),
+      since: z.string().optional().describe("ISO 8601 start of the range. Defaults to all recorded history."),
+      until: z.string().optional().describe("ISO 8601 end of the range. Defaults to now."),
+    },
+    async ({ username, since, until }) => {
+      const rows = getStateHistory(username, "collection_log", since ?? EPOCH, until ?? new Date().toISOString());
+      if (rows.length === 0) {
+        return { content: [{ type: "text", text: `No collection log items recorded for "${username}" in this range.` }] };
+      }
+      const lines = [`# ${username} — Collection log history`, ""];
+      for (const row of rows) {
+        lines.push(`  ${row.timestamp}: ${row.itemName} — ${row.oldState} → ${row.newState}`);
+      }
+      return { content: [{ type: "text", text: lines.join("\n") }] };
+    }
+  );
+
   return server;
 }
