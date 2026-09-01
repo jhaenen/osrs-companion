@@ -139,10 +139,14 @@ empty range returns a clean "no changes" message rather than an error.
 | Tool | Description |
 |------|-------------|
 | `skill_xp_gained` | Xp (skill) or kill count (boss/activity) gained over a period |
+| `skill_xp_gained_bulk` | Xp gained over a period for every synced skill in one call, plus optional boss/activity metrics |
+| `boss_kills_gained_bulk` | Kill count gained over a period for every synced boss/activity metric in one call |
 | `skill_xp_timeline` | Time series of changes for a skill or boss/activity metric |
 | `cooking_progress_since` | Projects time to a target Cooking level from a recent xp rate |
 | `quest_history` | Quest state changes over a period |
+| `diary_tiers_completed_since` | Tier completions for every synced diary region in one call, plus current status |
 | `diary_history` | Achievement diary tier completions over a period |
+| `combat_achievements_completed_since` | Task/tier completion summary over a period, plus current tier status |
 | `combat_achievement_history` | Combat achievement task/tier completions over a period |
 
 `skill_xp_gained` and `skill_xp_timeline` accept either a skill name (e.g.

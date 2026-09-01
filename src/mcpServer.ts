@@ -864,6 +864,109 @@ export function buildServer(): McpServer {
   );
 
   server.tool(
+    "skill_xp_gained_bulk",
+    "Get xp gained over a time period for every synced skill in one call, computed from stored history - use this instead of calling skill_xp_gained per skill when answering 'what did I train' style questions. Skills with zero change are included explicitly so 'no change' doesn't require a separate call to confirm. Optionally also include kill-count gains for a supplied list of boss/activity metrics (e.g. 'zulrah').",
+    {
+      username: z.string().describe("Player username"),
+      since: z.string().optional().describe("ISO 8601 timestamp to measure gain from. Defaults to 7 days ago."),
+      until: z.string().optional().describe("ISO 8601 timestamp to measure gain until. Defaults to now."),
+      metrics: z.array(z.string()).optional().describe("Additional boss/activity metric names (e.g. 'zulrah', 'clue_scrolls_easy') to include alongside all skills."),
+    },
+    async ({ username, since, until, metrics }) => {
+      const data = await readSnapshot(username);
+      if (!data) return { content: [{ type: "text", text: `No synced data found for "${username}".` }] };
+      if (!data.skills) return { content: [{ type: "text", text: `No skill data synced for "${username}".` }] };
+
+      const sinceIso = since ?? new Date(Date.now() - 7 * 24 * 3600 * 1000).toISOString();
+      const untilIso = until ?? new Date().toISOString();
+
+      // OVERALL is a derived sum of the other skills, not something trained
+      // in its own right - reporting it alongside them would just double-
+      // count the total already visible from summing the per-skill lines.
+      const skillNames = Object.keys(data.skills).filter((s) => s !== "OVERALL");
+      const skillGains = skillNames.map((name) => ({
+        name,
+        gain: getMetricGain(username, `skill:${name}`, sinceIso, untilIso),
+      }));
+      const totalXpGained = skillGains.reduce((sum, s) => sum + s.gain, 0);
+
+      const seenKeys = new Set(skillGains.map((s) => `skill:${s.name}`));
+      const activityGains: { label: string; gain: number }[] = [];
+      const unknownMetrics: string[] = [];
+      for (const metric of metrics ?? []) {
+        const resolved = resolveMetric(data, metric);
+        if (!resolved) {
+          unknownMetrics.push(metric);
+          continue;
+        }
+        if (seenKeys.has(resolved.key)) continue; // already covered by the full skill sweep
+        seenKeys.add(resolved.key);
+        activityGains.push({
+          label: resolved.label,
+          gain: getMetricGain(username, resolved.key, sinceIso, untilIso),
+        });
+      }
+
+      const lines: string[] = [
+        `# ${username} — Gains since ${sinceIso}`,
+        `${sinceIso} → ${untilIso}`,
+        `Total xp gained: +${totalXpGained.toLocaleString()}`,
+        "",
+        "## Skills",
+      ];
+      for (const { name, gain } of skillGains) {
+        lines.push(`  ${name}: +${gain.toLocaleString()} xp`);
+      }
+      if (activityGains.length > 0) {
+        lines.push("", "## Boss/Activity Metrics");
+        for (const { label, gain } of activityGains) {
+          lines.push(`  ${label}: +${gain.toLocaleString()} kills`);
+        }
+      }
+      if (unknownMetrics.length > 0) {
+        lines.push("", `Unknown metrics (skipped): ${unknownMetrics.join(", ")}`);
+      }
+
+      return { content: [{ type: "text", text: lines.join("\n") }] };
+    }
+  );
+
+  server.tool(
+    "boss_kills_gained_bulk",
+    "Get kill count gained over a time period for every synced boss/activity metric in one call, computed from stored history - use this instead of calling skill_xp_gained per boss when answering 'what did I kill' style questions. Metrics with zero change are included explicitly so 'no change' doesn't require a separate call to confirm.",
+    {
+      username: z.string().describe("Player username"),
+      since: z.string().optional().describe("ISO 8601 timestamp to measure gain from. Defaults to 7 days ago."),
+      until: z.string().optional().describe("ISO 8601 timestamp to measure gain until. Defaults to now."),
+    },
+    async ({ username, since, until }) => {
+      const data = await readSnapshot(username);
+      if (!data) return { content: [{ type: "text", text: `No synced data found for "${username}".` }] };
+      if (!data.bossKills) return { content: [{ type: "text", text: `No boss/activity kill count data synced for "${username}".` }] };
+
+      const sinceIso = since ?? new Date(Date.now() - 7 * 24 * 3600 * 1000).toISOString();
+      const untilIso = until ?? new Date().toISOString();
+
+      const gains = Object.keys(data.bossKills).map((boss) => ({
+        boss,
+        gain: getMetricGain(username, `kc:${boss}`, sinceIso, untilIso),
+      }));
+      const metricsWithGains = gains.filter((g) => g.gain > 0).length;
+
+      const lines: string[] = [
+        `# ${username} — Kill counts gained since ${sinceIso}`,
+        `${sinceIso} → ${untilIso}`,
+        `Metrics with activity: ${metricsWithGains} of ${gains.length}`,
+        "",
+      ];
+      for (const { boss, gain } of gains) {
+        lines.push(`  ${boss}: +${gain.toLocaleString()} kills`);
+      }
+      return { content: [{ type: "text", text: lines.join("\n") }] };
+    }
+  );
+
+  server.tool(
     "skill_xp_timeline",
     "Get the time series of changes for a skill or boss/activity metric over a date range, computed from stored history (not a live WOM call).",
     {
@@ -967,6 +1070,47 @@ export function buildServer(): McpServer {
   );
 
   server.tool(
+    "diary_tiers_completed_since",
+    "Get Achievement Diary tier completions for every synced region in one call, over a time range - regions with no change in the period are reported explicitly rather than omitted, alongside their current tier status. Complements diary_history, which lists raw completion events without the per-region 'nothing changed here' or current-status context.",
+    {
+      username: z.string().describe("Player username"),
+      since: z.string().optional().describe("ISO 8601 start of the range. Defaults to 7 days ago."),
+      until: z.string().optional().describe("ISO 8601 end of the range. Defaults to now."),
+    },
+    async ({ username, since, until }) => {
+      const data = await readSnapshot(username);
+      if (!data) return { content: [{ type: "text", text: `No synced data found for "${username}".` }] };
+      if (!data.achievementDiaries) return { content: [{ type: "text", text: `No diary data synced for "${username}".` }] };
+
+      const sinceIso = since ?? new Date(Date.now() - 7 * 24 * 3600 * 1000).toISOString();
+      const untilIso = until ?? new Date().toISOString();
+      const rows = getStateHistory(username, "diary", sinceIso, untilIso);
+
+      // itemName is "REGION:tier" (see diffDiaries in merge.ts).
+      const completedByRegion = new Map<string, string[]>();
+      for (const row of rows) {
+        if (row.newState !== "complete") continue;
+        const [region, tier] = row.itemName.split(":");
+        if (!completedByRegion.has(region)) completedByRegion.set(region, []);
+        completedByRegion.get(region)!.push(tier);
+      }
+
+      let totalCompleted = 0;
+      const lines: string[] = [`# ${username} — Diary tiers completed since ${sinceIso}`, `${sinceIso} → ${untilIso}`, ""];
+      for (const [region, diary] of Object.entries(data.achievementDiaries)) {
+        const check = (v: boolean) => (v ? "Done" : "---");
+        const status = `Easy=${check(diary.easy)} | Med=${check(diary.medium)} | Hard=${check(diary.hard)} | Elite=${check(diary.elite)}`;
+        const completed = completedByRegion.get(region) ?? [];
+        totalCompleted += completed.length;
+        const change = completed.length > 0 ? `completed ${completed.join(", ")}` : "no tier changes";
+        lines.push(`  ${region}: ${change} (currently ${status})`);
+      }
+      lines.push("", `Total tiers completed in this period: ${totalCompleted}`);
+      return { content: [{ type: "text", text: lines.join("\n") }] };
+    }
+  );
+
+  server.tool(
     "diary_history",
     "Get achievement diary tier completions for a player over a date range. Defaults to all recorded history.",
     {
@@ -983,6 +1127,71 @@ export function buildServer(): McpServer {
       for (const row of rows) {
         lines.push(`  ${row.timestamp}: ${row.itemName} — ${row.oldState} → ${row.newState}`);
       }
+      return { content: [{ type: "text", text: lines.join("\n") }] };
+    }
+  );
+
+  server.tool(
+    "combat_achievements_completed_since",
+    "Get combat achievement progress over a time range in one call - task completion count plus which tiers were newly finished, computed from stored history, alongside current tier status. Complements combat_achievement_history, which lists raw completion events without this summary/current-status framing.",
+    {
+      username: z.string().describe("Player username"),
+      since: z.string().optional().describe("ISO 8601 start of the range. Defaults to 7 days ago."),
+      until: z.string().optional().describe("ISO 8601 end of the range. Defaults to now."),
+    },
+    async ({ username, since, until }) => {
+      const data = await readSnapshot(username);
+      if (!data) return { content: [{ type: "text", text: `No synced data found for "${username}".` }] };
+      if (!data.combatAchievements) return { content: [{ type: "text", text: `No combat achievement data synced for "${username}".` }] };
+
+      const sinceIso = since ?? new Date(Date.now() - 7 * 24 * 3600 * 1000).toISOString();
+      const untilIso = until ?? new Date().toISOString();
+      const rows = getStateHistory(username, "combat_achievement", sinceIso, untilIso);
+
+      // Tier-milestone rows (itemName "tier:easy" etc., see diffCombatAchievements
+      // in merge.ts) are recorded alongside individual task rows - split them so
+      // the task count/list doesn't double up with the tier summary below.
+      const tierRowsInWindow = new Set(
+        rows
+          .filter((r) => r.itemName.startsWith("tier:") && r.newState === "complete")
+          .map((r) => r.itemName.slice("tier:".length))
+      );
+      const taskRows = rows.filter((r) => !r.itemName.startsWith("tier:"));
+
+      const ca = data.combatAchievements;
+      const tierFields: [string, boolean][] = [
+        ["easy", ca.easyComplete],
+        ["medium", ca.mediumComplete],
+        ["hard", ca.hardComplete],
+        ["elite", ca.eliteComplete],
+      ];
+
+      const lines: string[] = [
+        `# ${username} — Combat achievements since ${sinceIso}`,
+        `${sinceIso} → ${untilIso}`,
+        `Tasks completed in this period: ${taskRows.length}`,
+        "",
+        "## Tier status",
+      ];
+      for (const [tier, done] of tierFields) {
+        const label = tier[0].toUpperCase() + tier.slice(1);
+        const state = !done
+          ? "not yet complete"
+          : tierRowsInWindow.has(tier)
+            ? "reached in this period"
+            : "already complete before this period";
+        lines.push(`  ${label}: ${state}`);
+      }
+
+      if (taskRows.length > 0 && taskRows.length <= 100) {
+        lines.push("", "## Tasks completed");
+        for (const row of taskRows) {
+          lines.push(`  - ${row.itemName}`);
+        }
+      } else if (taskRows.length > 100) {
+        lines.push("", `Too many tasks to list individually (${taskRows.length}).`);
+      }
+
       return { content: [{ type: "text", text: lines.join("\n") }] };
     }
   );
