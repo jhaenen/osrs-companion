@@ -139,22 +139,26 @@ empty range returns a clean "no changes" message rather than an error.
 | Tool | Description |
 |------|-------------|
 | `skill_xp_gained` | Xp (skill) or kill count (boss/activity) gained over a period |
-| `skill_xp_gained_bulk` | Xp gained over a period for every synced skill in one call, plus optional boss/activity metrics |
-| `boss_kills_gained_bulk` | Kill count gained over a period for every synced boss/activity metric in one call |
 | `skill_xp_timeline` | Time series of changes for a skill or boss/activity metric |
 | `cooking_progress_since` | Projects time to a target Cooking level from a recent xp rate |
 | `quest_history` | Quest state changes over a period |
-| `diary_tiers_completed_since` | Tier completions for every synced diary region in one call, plus current status |
 | `diary_history` | Achievement diary tier completions over a period |
+| `diary_task_history` | Per-task achievement diary completions over a period (which task, region, tier, when) |
 | `combat_achievements_completed_since` | Task/tier completion summary over a period, plus current tier status |
 | `combat_achievement_history` | Combat achievement task/tier completions over a period |
-| `collection_log_completed_since` | Per-category completion counts gained over a period, plus best-effort item names observed unlocked |
 | `collection_log_history` | Collection log item unlocks observed over a period |
+| `progress_summary_since` | Combined skills + bosses + diaries (tier and per-task) + collection log summary over a period in one call; pass `include` to narrow to specific sections |
 
 `skill_xp_gained` and `skill_xp_timeline` accept either a skill name (e.g.
 `COOKING`) or a Wise Old Man boss/activity metric name (e.g. `zulrah`,
 `clue_scrolls_easy`) - both live in the same merged history, so the same
 tools cover both.
+
+`progress_summary_since` supersedes the old per-category bulk tools
+(`skill_xp_gained_bulk`, `boss_kills_gained_bulk`, `diary_tiers_completed_since`,
+`collection_log_completed_since`) - those have been removed in favor of one
+tool with an `include` filter, so there's no ambiguity between "the bulk
+tool" and "the combined tool" when answering a progress question.
 
 ## Deploying remotely (Docker + OAuth)
 

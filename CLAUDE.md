@@ -61,6 +61,15 @@ duplicated once a historical backfill correctly dated that same real event
 history row on first sighting, full stop.** There is no real "previous
 value" to diff against the first time a metric shows up, only a baseline.
 
+The same rule applies outside the max()-metric family too: `diffDiaryTasks`
+(per-task achievement diary completion, decoded from raw varp/varbit bits
+via `getDiaryTaskStatus`) skips diffing entirely when there's no prior
+`diaryTaskVarps`/`diaryTaskVarbits` to compare against - not just on a
+player's very first sync overall, but also the first sync *after* per-task
+diary syncing gets enabled for an existing player. Otherwise a veteran
+player's already-completed tasks would all record as "just now" on the
+first sync that starts sending the bits.
+
 ## Wise Old Man API facts worth not re-deriving
 
 - `GET /players/:username/snapshots` returns a player's **entire** history

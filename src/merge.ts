@@ -12,6 +12,7 @@ import type {
 } from "./schema.js";
 import { readSnapshot, writeSnapshot } from "./snapshotStore.js";
 import { recordMetricChange, recordStateChange, type MetricSource } from "./historyStore.js";
+import { getDiaryTaskStatus, listDiaryRegions } from "./diaryTasks.js";
 
 // One choke point for every write to the canonical merged snapshot, called
 // by both the plugin ingest endpoint and the WOM background poller. This is
@@ -127,6 +128,45 @@ function diffDiaries(
           `${region}:${tier}`,
           prevDone ? "complete" : "incomplete",
           newDone ? "complete" : "incomplete",
+          timestamp
+        );
+      }
+    }
+  }
+}
+
+// Per-task diary completion, decoded from the raw varp/varbit bag on both
+// sides via the same getDiaryTaskStatus() the read-path tools use - there's
+// no separately-stored decoded form to diff otherwise (see the
+// diaryTaskVarps/diaryTaskVarbits comment on MergeInput). itemName is
+// "REGION:tier:task text" - region and tier are both fixed, colon-free
+// enums, but task text itself can contain colons (e.g. "Note: ..."), so
+// only ever parse this back with a two-colon split, never a plain
+// itemName.split(":").
+const DIARY_TIERS = ["easy", "medium", "hard", "elite"] as const;
+
+function diffDiaryTasks(
+  username: string,
+  existingVarps: Record<string, number> | undefined,
+  existingVarbits: Record<string, number> | undefined,
+  incomingVarps: Record<string, number> | undefined,
+  incomingVarbits: Record<string, number> | undefined,
+  timestamp: string
+): void {
+  for (const region of listDiaryRegions()) {
+    for (const tier of DIARY_TIERS) {
+      const prevTasks = getDiaryTaskStatus(region, tier, existingVarps, existingVarbits);
+      const newTasks = getDiaryTaskStatus(region, tier, incomingVarps, incomingVarbits);
+      if (!prevTasks || !newTasks) continue;
+      for (const task of newTasks) {
+        const prevDone = prevTasks[task.index]?.done ?? false;
+        if (prevDone === task.done) continue;
+        recordStateChange(
+          username,
+          "diary_task",
+          `${region}:${tier}:${task.name}`,
+          prevDone ? "complete" : "incomplete",
+          task.done ? "complete" : "incomplete",
           timestamp
         );
       }
@@ -266,8 +306,25 @@ export async function mergeAndStore(input: MergeInput): Promise<void> {
       if (hasBaseline) diffDiaries(input.username, merged.achievementDiaries, input.achievementDiaries, input.timestamp);
       merged.achievementDiaries = input.achievementDiaries;
     }
-    if (input.diaryTaskVarps) merged.diaryTaskVarps = input.diaryTaskVarps;
-    if (input.diaryTaskVarbits) merged.diaryTaskVarbits = input.diaryTaskVarbits;
+    if (input.diaryTaskVarps || input.diaryTaskVarbits) {
+      // A veteran player's very first sync with per-task diary data has no
+      // prior varps/varbits to diff against - diffing that against "no
+      // data" (all bits unset) would record every already-done task as
+      // newly completed just now. Mirrors mergeSkills'/mergeBossKills'
+      // "seed silently, no row on first sighting" rule.
+      if (hasBaseline && (merged.diaryTaskVarps || merged.diaryTaskVarbits)) {
+        diffDiaryTasks(
+          input.username,
+          merged.diaryTaskVarps,
+          merged.diaryTaskVarbits,
+          input.diaryTaskVarps ?? merged.diaryTaskVarps,
+          input.diaryTaskVarbits ?? merged.diaryTaskVarbits,
+          input.timestamp
+        );
+      }
+      if (input.diaryTaskVarps) merged.diaryTaskVarps = input.diaryTaskVarps;
+      if (input.diaryTaskVarbits) merged.diaryTaskVarbits = input.diaryTaskVarbits;
+    }
     if (input.combatAchievements) {
       if (hasBaseline) diffCombatAchievements(input.username, merged.combatAchievements, input.combatAchievements, input.timestamp);
       merged.combatAchievements = input.combatAchievements;
